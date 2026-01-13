@@ -1,5 +1,6 @@
 
 import io
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +13,26 @@ import streamlit as st
 # -------------------------
 # Robust CSV loading (handles Fidelity footers)
 # -------------------------
+
+# ---- Simple access gate (set APP_PASS as an environment variable / Streamlit secret) ----
+APP_PASS = os.getenv("APP_PASS", "")
+
+if APP_PASS:
+    code = st.sidebar.text_input("Access code", type="password")
+
+    if not code:
+        st.title("🔒 Trade Analyzer")
+        st.sidebar.info("Enter access code to continue.")
+        st.stop()
+
+    if code != APP_PASS:
+        st.title("🔒 Trade Analyzer")
+        st.sidebar.error("Wrong access code.")
+        st.stop()
+# ---------------------------------------------------------------------------------------
+
+
+
 DATE_LINE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{4}\s*,")
 HEADER_RE = re.compile(r"^\s*Run Date\s*,", re.IGNORECASE)
 
