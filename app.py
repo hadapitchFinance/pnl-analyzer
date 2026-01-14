@@ -125,6 +125,7 @@ OCC_OPT_RE = re.compile(r"^(?P<under>[A-Z ]{1,6})(?P<y>\d{2})(?P<m>\d{2})(?P<d>\
 FID_OPT_RE = re.compile(r"^-?(?P<under>[A-Z]{1,6})(?P<y>\d{2})(?P<m>\d{2})(?P<d>\d{2})(?P<right>[CP])(?P<k>\d{1,6})(?:\.\d+)?$")
 FID_DESC_RE = re.compile(r"\b(?P<mon>JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(?P<day>\d{1,2})\s+(?P<yy>\d{2})\s+\$(?P<strike>\d+(?:\.\d+)?)\b", re.IGNORECASE)
 MON_MAP = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+STOCK_RE = re.compile(r"^[A-Z]{1,6}(?:\.[A-Z]{1,2})?$")
 
 def _parse_mmddyy(s: str) -> Optional[pd.Timestamp]:
     dt = pd.to_datetime(str(s).strip(), errors="coerce")
@@ -190,6 +191,9 @@ def parse_option(underlying_hint: Optional[str], symbol_text: str, desc_text: Op
                 exp, strike = exs
                 return str(underlying_hint).strip().upper(), exp, float(strike), right
     return None
+
+def looks_like_stock(symbol_text: str) -> bool:
+    return bool(STOCK_RE.match(str(symbol_text).strip().upper()))
 
 # -------------------------
 # FIFO matching
@@ -284,7 +288,11 @@ def fifo_match(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def _contract_key(df: pd.DataFrame) -> pd.Series:
     expiry = pd.to_datetime(df["expiry"], errors="coerce").dt.date.astype(str)
     strike = pd.to_numeric(df["strike"], errors="coerce").astype(str)
-    return df["underlying"].astype(str) + "|" + expiry + "|" + strike + "|" + df["right"].astype(str)
+    right = df["right"].astype(str).fillna("STOCK")
+    base = df["underlying"].astype(str)
+    stock_mask = right.str.upper().eq("STOCK")
+    opt_key = base + "|" + expiry + "|" + strike + "|" + right
+    return opt_key.where(~stock_mask, base + "|STOCK")
 
 def detect_mistakes(closed_trades: pd.DataFrame, fills: Optional[pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     if closed_trades.empty:
@@ -648,7 +656,7 @@ def _series(df: pd.DataFrame, name: str, default="") -> pd.Series:
         return pd.Series([default] * len(df), index=df.index)
     return df[col]
 
-def normalize_fidelity(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_fidelity(df: pd.DataFrame, include_stocks: bool) -> pd.DataFrame:
     w = df.copy()
 
     run_date = _series(w, "Run Date", default=np.nan)
@@ -670,22 +678,57 @@ def normalize_fidelity(df: pd.DataFrame) -> pd.DataFrame:
     fees = pd.to_numeric(_series(w, "Fees", default=0.0), errors="coerce").fillna(0.0)
     w["fees"] = (comm + fees).astype(float)
 
-    w["multiplier"] = 100.0
-
     sym = _series(w, "Symbol", default="").astype(str)
     desc = _series(w, "Description", default="").astype(str)
-    underlying_hint = sym.str.replace("^-", "", regex=True).str.extract(r"^([A-Z]{1,6})", expand=False)
+    clean_sym = sym.str.replace("^-", "", regex=True).str.strip().str.upper()
+    underlying_hint = clean_sym.str.extract(r"^([A-Z]{1,6})", expand=False)
 
     parsed = [parse_option(uh, s, d) for uh, s, d in zip(underlying_hint, sym, desc)]
-    ok = [p is not None for p in parsed]
-    w = w[ok].copy()
-    w[["underlying", "expiry", "strike", "right"]] = pd.DataFrame([p for p in parsed if p is not None], index=w.index)
+    asset_type = []
+    underlying = []
+    expiry = []
+    strike = []
+    right = []
+    for p, raw_sym in zip(parsed, clean_sym):
+        if p is not None:
+            u, e, k, r = p
+            asset_type.append("Option")
+            underlying.append(u)
+            expiry.append(e)
+            strike.append(k)
+            right.append(r)
+        elif include_stocks and looks_like_stock(raw_sym):
+            asset_type.append("Stock")
+            underlying.append(raw_sym)
+            expiry.append(pd.NaT)
+            strike.append(np.nan)
+            right.append("Stock")
+        else:
+            asset_type.append(None)
+            underlying.append(None)
+            expiry.append(pd.NaT)
+            strike.append(np.nan)
+            right.append(None)
 
-    w["contract_id"] = (w["underlying"].astype(str) + "|" + w["expiry"].astype(str) + "|" +
-                        w["strike"].astype(str) + "|" + w["right"].astype(str))
+    ok = [a is not None for a in asset_type]
+    w = w[ok].copy()
+    w["asset_type"] = [a for a in asset_type if a is not None]
+    w["underlying"] = [u for u, a in zip(underlying, asset_type) if a is not None]
+    w["expiry"] = [e for e, a in zip(expiry, asset_type) if a is not None]
+    w["strike"] = [k for k, a in zip(strike, asset_type) if a is not None]
+    w["right"] = [r for r, a in zip(right, asset_type) if a is not None]
+
+    w["multiplier"] = np.where(w["asset_type"] == "Stock", 1.0, 100.0)
+
+    w["contract_id"] = np.where(
+        w["asset_type"] == "Stock",
+        w["underlying"].astype(str) + "|STOCK",
+        w["underlying"].astype(str) + "|" + w["expiry"].astype(str) + "|" +
+        w["strike"].astype(str) + "|" + w["right"].astype(str),
+    )
     return w.sort_values("trade_dt").reset_index(drop=True)
 
-def normalize_ibkr(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+def normalize_ibkr(df: pd.DataFrame, mapping: Dict[str, str], include_stocks: bool) -> pd.DataFrame:
     w = df.copy()
 
     w["trade_dt"] = pd.to_datetime(w[mapping["datetime"]], errors="coerce")
@@ -705,20 +748,61 @@ def normalize_ibkr(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
     w["multiplier"] = pd.to_numeric(w[multcol], errors="coerce").fillna(100.0).astype(float) if multcol else 100.0
 
     sym = w[mapping["symbol"]].astype(str)
+    clean_sym = sym.str.strip().str.upper()
     parsed = [parse_option(None, s, None) for s in sym]
-    ok = [p is not None for p in parsed]
-    w = w[ok].copy()
-    w[["underlying", "expiry", "strike", "right"]] = pd.DataFrame([p for p in parsed if p is not None], index=w.index)
+    asset_type = []
+    underlying = []
+    expiry = []
+    strike = []
+    right = []
+    for p, raw_sym in zip(parsed, clean_sym):
+        if p is not None:
+            u, e, k, r = p
+            asset_type.append("Option")
+            underlying.append(u)
+            expiry.append(e)
+            strike.append(k)
+            right.append(r)
+        elif include_stocks and looks_like_stock(raw_sym):
+            asset_type.append("Stock")
+            underlying.append(raw_sym)
+            expiry.append(pd.NaT)
+            strike.append(np.nan)
+            right.append("Stock")
+        else:
+            asset_type.append(None)
+            underlying.append(None)
+            expiry.append(pd.NaT)
+            strike.append(np.nan)
+            right.append(None)
 
-    w["contract_id"] = (w["underlying"].astype(str) + "|" + w["expiry"].astype(str) + "|" +
-                        w["strike"].astype(str) + "|" + w["right"].astype(str))
+    ok = [a is not None for a in asset_type]
+    w = w[ok].copy()
+    w["asset_type"] = [a for a in asset_type if a is not None]
+    w["underlying"] = [u for u, a in zip(underlying, asset_type) if a is not None]
+    w["expiry"] = [e for e, a in zip(expiry, asset_type) if a is not None]
+    w["strike"] = [k for k, a in zip(strike, asset_type) if a is not None]
+    w["right"] = [r for r, a in zip(right, asset_type) if a is not None]
+    w["multiplier"] = np.where(w["asset_type"] == "Stock", 1.0, w["multiplier"])
+
+    w["contract_id"] = np.where(
+        w["asset_type"] == "Stock",
+        w["underlying"].astype(str) + "|STOCK",
+        w["underlying"].astype(str) + "|" + w["expiry"].astype(str) + "|" +
+        w["strike"].astype(str) + "|" + w["right"].astype(str),
+    )
     return w.sort_values("trade_dt").reset_index(drop=True)
 
 # -------------------------
 # UI
 # -------------------------
-st.title("Trade Analyzer (IBKR + Fidelity) — Options FIFO P&L → Excel")
+st.title("Trade Analyzer (IBKR + Fidelity) — Options/Stocks FIFO P&L → Excel")
 st.caption("Supports Fidelity 'Accounts History' CSV (with disclaimer footer) and IBKR CSV (with mapping).")
+include_stocks = st.toggle(
+    "Include stock trades in P&L calculations",
+    value=False,
+    help="When enabled, equity trades are included alongside options.",
+)
 
 uploaded = st.file_uploader("Upload CSV", type=["csv", "txt"])
 if not uploaded:
@@ -743,7 +827,7 @@ work = None
 
 if broker == "Fidelity":
     try:
-        work = normalize_fidelity(df)
+        work = normalize_fidelity(df, include_stocks)
     except Exception as e:
         st.error(f"Failed to parse Fidelity file: {e}")
         st.stop()
@@ -784,7 +868,7 @@ elif broker == "IBKR":
     }
 
     try:
-        work = normalize_ibkr(df, mapping)
+        work = normalize_ibkr(df, mapping, include_stocks)
     except Exception as e:
         st.error(f"Failed to parse IBKR file: {e}")
         st.stop()
@@ -792,21 +876,25 @@ else:
     st.error("Could not auto-detect broker. Choose Fidelity or IBKR.")
     st.stop()
 
-with st.expander("Parsed options preview", expanded=True):
+with st.expander("Parsed trades preview", expanded=True):
     if work is None or work.empty:
-        st.warning("No option trades parsed from this file.")
+        st.warning("No trades parsed from this file.")
         st.stop()
 
-    st.dataframe(work[["trade_dt", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80), use_container_width=True)
+    st.dataframe(
+        work[["trade_dt", "asset_type", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80),
+        use_container_width=True,
+    )
 
 # FIFO per contract
 closed_all = []
 open_all = []
 for cid, g in work.groupby("contract_id", sort=False):
-    g2 = g[["trade_dt", "side", "qty", "price", "fees", "multiplier", "underlying", "expiry", "strike", "right"]].sort_values("trade_dt")
+    g2 = g[["trade_dt", "side", "qty", "price", "fees", "multiplier", "asset_type", "underlying", "expiry", "strike", "right"]].sort_values("trade_dt")
     closed_df, open_df = fifo_match(g2)
     if not closed_df.empty:
         closed_df["contract_id"] = cid
+        closed_df["asset_type"] = g2["asset_type"].iloc[0]
         closed_df["underlying"] = g2["underlying"].iloc[0]
         closed_df["expiry"] = g2["expiry"].iloc[0]
         closed_df["strike"] = g2["strike"].iloc[0]
@@ -814,6 +902,7 @@ for cid, g in work.groupby("contract_id", sort=False):
         closed_all.append(closed_df)
     if not open_df.empty:
         open_df["contract_id"] = cid
+        open_df["asset_type"] = g2["asset_type"].iloc[0]
         open_df["underlying"] = g2["underlying"].iloc[0]
         open_df["expiry"] = g2["expiry"].iloc[0]
         open_df["strike"] = g2["strike"].iloc[0]
@@ -914,7 +1003,7 @@ else:
             under_sel = st.multiselect("Underlying", options=sorted(ts["underlying"].unique().tolist()),
                                        default=sorted(ts["underlying"].unique().tolist()))
         with c2:
-            right_sel = st.multiselect("Type (C/P)", options=sorted(ts["right"].unique().tolist()),
+            right_sel = st.multiselect("Type (C/P/Stock)", options=sorted(ts["right"].unique().tolist()),
                                        default=sorted(ts["right"].unique().tolist()))
         with c3:
             pos_sel = st.multiselect("Position (SHORT/LONG)", options=sorted(ts["position_type"].unique().tolist()),
@@ -1010,7 +1099,7 @@ else:
             st.dataframe(by_under, use_container_width=True)
 
         with c2:
-            st.markdown("**By option type & position**")
+            st.markdown("**By instrument type & position**")
             by_type = (f.groupby(["right","position_type"], as_index=False)
                        .agg(trades=("net_pnl","size"),
                             win_rate=("net_pnl", lambda s: float((s>0).mean())),
@@ -1314,7 +1403,13 @@ with st.expander("Actionable recommendations", expanded=True):
         seg2 = seg[seg["trades"] >= 10].copy()
         if not seg2.empty:
             worst = seg2.iloc[0]
-            reco_lines.append(f"**Stop/Reduce this losing segment:** {worst['underlying']} {worst['position_type']} {('Calls' if worst['right']=='C' else 'Puts')} — net ${float(worst['net_pnl']):,.2f} over {int(worst['trades'])} matches (win rate {float(worst['win_rate'])*100:,.1f}%).")
+            if worst["right"] == "C":
+                right_label = "Calls"
+            elif worst["right"] == "P":
+                right_label = "Puts"
+            else:
+                right_label = "Stock"
+            reco_lines.append(f"**Stop/Reduce this losing segment:** {worst['underlying']} {worst['position_type']} {right_label} — net ${float(worst['net_pnl']):,.2f} over {int(worst['trades'])} matches (win rate {float(worst['win_rate'])*100:,.1f}%).")
 
         # SPY focus if present
         spy = seg[seg["underlying"] == "SPY"].copy()
