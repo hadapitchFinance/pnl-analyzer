@@ -10,25 +10,20 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -------------------------
-# Robust CSV loading (handles Fidelity footers)
-# -------------------------
+st.set_page_config(page_title="Trade Analyzer (IBKR + Fidelity)", layout="wide")
 
-# ---- Simple access gate (set APP_PASS as an environment variable / Streamlit secret) ----
 APP_PASS = os.getenv("APP_PASS", "")
 
 if APP_PASS:
     code = st.sidebar.text_input("Access code", type="password")
-
-    if not code:
-        st.title("🔒 Trade Analyzer")
-        st.sidebar.info("Enter access code to continue.")
-        st.stop()
-
     if code != APP_PASS:
         st.title("🔒 Trade Analyzer")
-        st.sidebar.error("Wrong access code.")
+        if code:
+            st.sidebar.error("Wrong access code.")
+        else:
+            st.sidebar.warning("Enter access code to continue.")
         st.stop()
+
 # ---------------------------------------------------------------------------------------
 
 
@@ -318,7 +313,6 @@ def normalize_ibkr(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
 # -------------------------
 # UI
 # -------------------------
-st.set_page_config(page_title="Trade Analyzer (IBKR + Fidelity)", layout="wide")
 st.title("Trade Analyzer (IBKR + Fidelity) — Options FIFO P&L → Excel")
 st.caption("Supports Fidelity 'Accounts History' CSV (with disclaimer footer) and IBKR CSV (with mapping).")
 
