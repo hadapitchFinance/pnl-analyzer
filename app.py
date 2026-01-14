@@ -1,5 +1,5 @@
-
 import calendar
+import csv
 import io
 import os
 import re
@@ -56,6 +56,25 @@ def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
     def _read(t: str, sep_: str) -> pd.DataFrame:
         return pd.read_csv(io.StringIO(t), sep=sep_, engine="python", skip_blank_lines=True)
 
+    def _read_flexible(t: str, sep_: str) -> pd.DataFrame:
+        rows = []
+        reader = csv.reader(io.StringIO(t), delimiter=sep_)
+        for row in reader:
+            if any(cell.strip() for cell in row):
+                rows.append(row)
+        if not rows:
+            return pd.DataFrame()
+        header = rows[0]
+        width = len(header)
+        fixed_rows = []
+        for row in rows[1:]:
+            if len(row) < width:
+                row = row + [""] * (width - len(row))
+            elif len(row) > width:
+                row = row[: width - 1] + [sep_.join(row[width - 1 :])]
+            fixed_rows.append(row)
+        return pd.DataFrame(fixed_rows, columns=header)
+
     try:
         df = _read(text, sep)
         # If it parsed into 1 column and looks wrong, fall through to clean read
@@ -63,6 +82,12 @@ def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
             raise ValueError("Single-column parse; attempting cleaned parse")
         return df
     except Exception:
+        try:
+            df = _read_flexible(text, sep)
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            pass
         # Clean: keep header + date-starting lines only
         lines = [ln for ln in text.splitlines() if ln.strip()]
         # find header
@@ -85,7 +110,10 @@ def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
 
         cleaned = "\n".join(keep)
         # Fidelity is comma-separated
-        df = _read(cleaned, ",")
+        try:
+            df = _read(cleaned, ",")
+        except Exception:
+            df = _read_flexible(cleaned, ",")
         return df
 
 # -------------------------
