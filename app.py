@@ -13,6 +13,64 @@ import streamlit as st
 
 st.set_page_config(page_title="Trade Analyzer (IBKR + Fidelity)", layout="wide")
 
+st.markdown(
+    """
+    <style>
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 0.9rem;
+        }
+        .stat-card {
+            background: linear-gradient(145deg, #101827, #0d1522);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 16px;
+            padding: 16px 18px;
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.28);
+        }
+        .stat-card .stat-label {
+            color: #93c5fd;
+            font-size: 0.85rem;
+            letter-spacing: 0.02em;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+        .stat-card .stat-value {
+            color: #f8fafc;
+            font-size: 1.55rem;
+            font-weight: 700;
+        }
+        .stat-card .stat-sub {
+            color: #cbd5f5;
+            font-size: 0.85rem;
+            margin-top: 6px;
+        }
+        .section-card {
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 18px;
+            padding: 16px 18px 6px;
+            margin-bottom: 16px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def render_stat_cards(items: List[Dict[str, str]]) -> None:
+    cards = "".join(
+        [
+            "<div class='stat-card'>"
+            f"<div class='stat-label'>{item['label']}</div>"
+            f"<div class='stat-value'>{item['value']}</div>"
+            f"<div class='stat-sub'>{item.get('sub', '')}</div>"
+            "</div>"
+            for item in items
+        ]
+    )
+    st.markdown(f"<div class='dashboard-grid'>{cards}</div>", unsafe_allow_html=True)
+
 APP_PASS = os.getenv("APP_PASS", "")
 
 if APP_PASS:
@@ -921,10 +979,25 @@ with st.expander("Results", expanded=True):
     show_open = pnl_view == "Closed + Open (separate)"
 
     if not closed.empty:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Realized net P&L (closed only)", f"${closed['net_pnl'].sum():,.2f}")
-        c2.metric("Closed matches", f"{len(closed):,}")
-        c3.metric("Win rate", f"{(closed['net_pnl'] > 0).mean() * 100:,.1f}%")
+        render_stat_cards(
+            [
+                {
+                    "label": "Realized net P&L",
+                    "value": f"${closed['net_pnl'].sum():,.2f}",
+                    "sub": "Closed trades only",
+                },
+                {
+                    "label": "Closed matches",
+                    "value": f"{len(closed):,}",
+                    "sub": "FIFO matched",
+                },
+                {
+                    "label": "Win rate",
+                    "value": f"{(closed['net_pnl'] > 0).mean() * 100:,.1f}%",
+                    "sub": "Closed trades",
+                },
+            ]
+        )
     else:
         st.warning("No closed trades detected after FIFO matching (you may only have open positions).")
 
@@ -935,9 +1008,20 @@ with st.expander("Results", expanded=True):
     if show_open:
         if not openpos.empty:
             st.markdown("### Open positions (unrealized, shown separately)")
-            o1, o2 = st.columns(2)
-            o1.metric("Open premium (cashflow, not P&L)", f"${openpos['net_premium'].sum():,.2f}")
-            o2.metric("Open lots", f"{len(openpos):,}")
+            render_stat_cards(
+                [
+                    {
+                        "label": "Open premium",
+                        "value": f"${openpos['net_premium'].sum():,.2f}",
+                        "sub": "Cashflow, not P&L",
+                    },
+                    {
+                        "label": "Open lots",
+                        "value": f"{len(openpos):,}",
+                        "sub": "Positions still open",
+                    },
+                ]
+            )
             st.dataframe(
                 openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]),
                 use_container_width=True,
@@ -1045,19 +1129,61 @@ else:
         profit_factor = (wins.sum() / abs(losses.sum())) if len(losses) and len(wins) else np.nan
         expectancy = avg  # same as avg net per closed match
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Net P&L (filtered)", f"${total_net:,.2f}")
-        c2.metric("Trades (closed matches)", f"{n:,}")
-        c3.metric("Win rate", f"{win_rate*100:,.1f}%")
-        c4.metric("Expectancy / trade", f"${expectancy:,.2f}")
-        c5.metric("Profit factor", "—" if np.isnan(profit_factor) else f"{profit_factor:,.2f}")
+        render_stat_cards(
+            [
+                {
+                    "label": "Net P&L",
+                    "value": f"${total_net:,.2f}",
+                    "sub": "Filtered trades",
+                },
+                {
+                    "label": "Trades",
+                    "value": f"{n:,}",
+                    "sub": "Closed matches",
+                },
+                {
+                    "label": "Win rate",
+                    "value": f"{win_rate*100:,.1f}%",
+                    "sub": "Filtered trades",
+                },
+                {
+                    "label": "Expectancy / trade",
+                    "value": f"${expectancy:,.2f}",
+                    "sub": "Avg net per trade",
+                },
+                {
+                    "label": "Profit factor",
+                    "value": "—" if np.isnan(profit_factor) else f"{profit_factor:,.2f}",
+                    "sub": "Gross wins / losses",
+                },
+            ]
+        )
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Avg win", f"${avg_win:,.2f}" if len(wins) else "—")
-        c2.metric("Avg loss", f"${avg_loss:,.2f}" if len(losses) else "—")
-        c3.metric("Payoff ratio", "—" if np.isnan(payoff) else f"{payoff:,.2f}")
         fee_drag = (total_fees / abs(total_gross)) if total_gross else np.nan
-        c4.metric("Fee drag", "—" if np.isnan(fee_drag) else f"{fee_drag*100:,.2f}%")
+        render_stat_cards(
+            [
+                {
+                    "label": "Avg win",
+                    "value": f"${avg_win:,.2f}" if len(wins) else "—",
+                    "sub": "Winning trades",
+                },
+                {
+                    "label": "Avg loss",
+                    "value": f"${avg_loss:,.2f}" if len(losses) else "—",
+                    "sub": "Losing trades",
+                },
+                {
+                    "label": "Payoff ratio",
+                    "value": "—" if np.isnan(payoff) else f"{payoff:,.2f}",
+                    "sub": "Avg win / loss",
+                },
+                {
+                    "label": "Fee drag",
+                    "value": "—" if np.isnan(fee_drag) else f"{fee_drag*100:,.2f}%",
+                    "sub": "Fees vs gross P&L",
+                },
+            ]
+        )
 
         # Equity curve + drawdown
         curve = f.sort_values("close_date")[["close_date", "net_pnl"]].copy()
