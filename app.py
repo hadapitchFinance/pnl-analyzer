@@ -250,6 +250,185 @@ def fifo_match(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame(closed), pd.DataFrame(open_rows)
 
 # -------------------------
+# Mistake detector helpers
+# -------------------------
+def _contract_key(df: pd.DataFrame) -> pd.Series:
+    expiry = pd.to_datetime(df["expiry"], errors="coerce").dt.date.astype(str)
+    strike = pd.to_numeric(df["strike"], errors="coerce").astype(str)
+    return df["underlying"].astype(str) + "|" + expiry + "|" + strike + "|" + df["right"].astype(str)
+
+def detect_mistakes(closed_trades: pd.DataFrame, fills: Optional[pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    if closed_trades.empty:
+        empty = pd.DataFrame(columns=[
+            "mistake_type", "severity", "close_date", "underlying", "contract_key",
+            "trade_id", "details", "net_pnl"
+        ])
+        return {
+            "mistakes_df": empty,
+            "summary_by_type": empty,
+            "summary_by_week": empty,
+            "examples_by_type": empty,
+            "held_tables": {},
+        }
+
+    base = closed_trades.copy()
+    base["close_date"] = pd.to_datetime(base["close_date"], errors="coerce")
+    base["open_date"] = pd.to_datetime(base["open_date"], errors="coerce")
+    base["trade_date"] = base["close_date"].dt.date
+    base["holding_days"] = (base["close_date"] - base["open_date"]).dt.total_seconds() / (24 * 3600)
+    base["contract_key"] = _contract_key(base)
+    base["net_pnl"] = pd.to_numeric(base["net_pnl"], errors="coerce").fillna(0.0)
+
+    mistakes: List[Dict[str, object]] = []
+
+    # Rule 1: Overtrading day
+    day_stats = (base.groupby("trade_date", as_index=False)
+                 .agg(day_trade_count=("net_pnl", "size"), day_pnl=("net_pnl", "sum")))
+    if not day_stats.empty:
+        threshold = float(np.percentile(day_stats["day_trade_count"], 80))
+        over = day_stats[(day_stats["day_trade_count"] >= threshold) & (day_stats["day_pnl"] < 0)]
+        for _, row in over.iterrows():
+            mistakes.append({
+                "mistake_type": "Overtrading day",
+                "severity": abs(float(row["day_pnl"])),
+                "close_date": pd.Timestamp(row["trade_date"]),
+                "underlying": "MULTI",
+                "contract_key": "MULTI",
+                "trade_id": str(row["trade_date"]),
+                "details": f"{int(row['day_trade_count'])} closes, day PnL {row['day_pnl']:.2f}",
+                "net_pnl": float(row["day_pnl"]),
+            })
+
+    # Rule 2: Big loss outlier
+    losers = base[base["net_pnl"] < 0]
+    winners = base[base["net_pnl"] > 0]
+    if not losers.empty:
+        base_loss = float(np.median(np.abs(losers["net_pnl"])))
+        avg_win = float(winners["net_pnl"].mean()) if not winners.empty else 0.0
+        threshold = max(3 * base_loss, 2 * avg_win) if avg_win > 0 else 3 * base_loss
+        flagged = losers[np.abs(losers["net_pnl"]) >= threshold]
+        for _, row in flagged.iterrows():
+            mistakes.append({
+                "mistake_type": "Big loss outlier",
+                "severity": abs(float(row["net_pnl"])),
+                "close_date": row["close_date"],
+                "underlying": row["underlying"],
+                "contract_key": row["contract_key"],
+                "trade_id": str(row.get("trade_id", row.name)),
+                "details": f"Loss {row['net_pnl']:.2f} exceeds threshold",
+                "net_pnl": float(row["net_pnl"]),
+            })
+
+    # Rule 3: Held losers longer than winners
+    held_tables = {}
+    hold_ok = base["open_date"].notna().all()
+    if hold_ok:
+        winners_hold = base[base["net_pnl"] > 0]["holding_days"].dropna()
+        losers_hold = base[base["net_pnl"] < 0]["holding_days"].dropna()
+        if len(winners_hold) >= 5 and len(losers_hold) >= 5:
+            med_w = float(np.median(winners_hold))
+            med_l = float(np.median(losers_hold))
+            if med_l > med_w * 1.25:
+                last_close = base["close_date"].max()
+                mistakes.append({
+                    "mistake_type": "Held losers longer",
+                    "severity": med_l - med_w,
+                    "close_date": last_close,
+                    "underlying": "MULTI",
+                    "contract_key": "MULTI",
+                    "trade_id": "global",
+                    "details": f"Median hold losers {med_l:.1f}d vs winners {med_w:.1f}d",
+                    "net_pnl": np.nan,
+                })
+
+        held_tables = {
+            "losers": base[base["net_pnl"] < 0].sort_values("holding_days", ascending=False).head(10),
+            "winners": base[base["net_pnl"] > 0].sort_values("holding_days", ascending=False).head(10),
+        }
+
+    # Rule 4: Gave back gains in ticker
+    ticker = (base.groupby("underlying", as_index=False)
+              .agg(ticker_net=("net_pnl", "sum"),
+                   total_trades=("net_pnl", "size"),
+                   has_wins=("net_pnl", lambda s: bool((s > 0).any())),
+                   has_losses=("net_pnl", lambda s: bool((s < 0).any())),
+                   last_close=("close_date", "max")))
+    flagged = ticker[(ticker["ticker_net"] < 0) & ticker["has_wins"] & ticker["has_losses"] & (ticker["total_trades"] >= 5)]
+    for _, row in flagged.iterrows():
+        mistakes.append({
+            "mistake_type": "Gave back gains in ticker",
+            "severity": abs(float(row["ticker_net"])),
+            "close_date": row["last_close"],
+            "underlying": row["underlying"],
+            "contract_key": "MULTI",
+            "trade_id": str(row["underlying"]),
+            "details": f"Net {row['ticker_net']:.2f} across {int(row['total_trades'])} trades with both wins & losses",
+            "net_pnl": float(row["ticker_net"]),
+        })
+
+    # Rule 5: Averaged down losers (fills-based)
+    if fills is not None and not fills.empty:
+        fills_work = fills.copy()
+        fills_work["contract_key"] = _contract_key(fills_work)
+        for contract_key, g in fills_work.sort_values("trade_dt").groupby("contract_key", sort=False):
+            net_pos = 0
+            add_events = 0
+            for _, r in g.iterrows():
+                side = str(r["side"]).upper()
+                qty = int(r["qty"])
+                before = net_pos
+                if side == "BUY":
+                    net_pos += qty
+                    if before >= 0 and net_pos > before:
+                        add_events += 1
+                elif side == "SELL":
+                    net_pos -= qty
+                    if before <= 0 and net_pos < before:
+                        add_events += 1
+            contract_net = float(base.loc[base["contract_key"] == contract_key, "net_pnl"].sum())
+            if add_events >= 2 and contract_net < 0:
+                parts = contract_key.split("|")
+                mistakes.append({
+                    "mistake_type": "Averaged down (added to loser)",
+                    "severity": abs(contract_net),
+                    "close_date": base.loc[base["contract_key"] == contract_key, "close_date"].max(),
+                    "underlying": parts[0] if parts else "UNKNOWN",
+                    "contract_key": contract_key,
+                    "trade_id": contract_key,
+                    "details": f"{add_events} adds, net {contract_net:.2f}",
+                    "net_pnl": contract_net,
+                })
+
+    mistakes_df = pd.DataFrame(mistakes)
+    if mistakes_df.empty:
+        summary_by_type = pd.DataFrame(columns=["mistake_type", "count", "total_damage", "avg_damage"])
+        summary_by_week = pd.DataFrame(columns=["week_key", "mistake_type", "count", "total_damage"])
+        examples_by_type = pd.DataFrame(columns=mistakes_df.columns)
+    else:
+        mistakes_df["severity"] = pd.to_numeric(mistakes_df["severity"], errors="coerce").fillna(0.0)
+        mistakes_df["close_date"] = pd.to_datetime(mistakes_df["close_date"], errors="coerce")
+        summary_by_type = (mistakes_df.groupby("mistake_type", as_index=False)
+                           .agg(count=("mistake_type", "size"),
+                                total_damage=("severity", "sum"),
+                                avg_damage=("severity", "mean"))
+                           .sort_values("total_damage", ascending=False))
+        iso = mistakes_df["close_date"].dt.isocalendar()
+        week_key = iso["year"].astype(str) + "-W" + iso["week"].astype(str).str.zfill(2)
+        summary_by_week = (mistakes_df.assign(week_key=week_key)
+                           .groupby(["week_key", "mistake_type"], as_index=False)
+                           .agg(count=("mistake_type", "size"),
+                                total_damage=("severity", "sum")))
+        examples_by_type = mistakes_df.sort_values("severity", ascending=False)
+
+    return {
+        "mistakes_df": mistakes_df,
+        "summary_by_type": summary_by_type,
+        "summary_by_week": summary_by_week,
+        "examples_by_type": examples_by_type,
+        "held_tables": held_tables,
+    }
+
+# -------------------------
 # Broker detection + normalization
 # -------------------------
 def detect_broker(columns: List[str]) -> str:
@@ -642,6 +821,94 @@ else:
                     cur = 0
             return best
         st.caption(f"Max win streak: **{max_streak(outcomes, True)}** | Max loss streak: **{max_streak(outcomes, False)}**")
+
+# -------------------------
+# Mistake detector
+# -------------------------
+with st.expander("Mistake Detector", expanded=False):
+    if trades_sheet.empty:
+        st.info("No closed trades to analyze for mistakes.")
+    else:
+        base_mistakes = trades_sheet.copy()
+        base_mistakes["open_date"] = base_mistakes[["buy_date", "sell_date"]].min(axis=1)
+        base_mistakes["close_date"] = base_mistakes[["buy_date", "sell_date"]].max(axis=1)
+
+        mistake_output = detect_mistakes(base_mistakes, work)
+        mistakes_df = mistake_output["mistakes_df"]
+        summary_by_type = mistake_output["summary_by_type"]
+        summary_by_week = mistake_output["summary_by_week"]
+        examples_by_type = mistake_output["examples_by_type"]
+        held_tables = mistake_output["held_tables"]
+
+        if mistakes_df.empty:
+            st.info("No mistakes detected with current rules.")
+        else:
+            top_leak = summary_by_type.iloc[0] if not summary_by_type.empty else None
+            over_cnt = int((mistakes_df["mistake_type"] == "Overtrading day").sum())
+            big_loss_cnt = int((mistakes_df["mistake_type"] == "Big loss outlier").sum())
+
+            c1, c2, c3 = st.columns(3)
+            if top_leak is not None:
+                c1.metric("Top leak", f"{top_leak['mistake_type']} (${top_leak['total_damage']:,.2f})")
+            else:
+                c1.metric("Top leak", "—")
+            c2.metric("Overtrading days", f"{over_cnt:,}")
+            c3.metric("Big loss outliers", f"{big_loss_cnt:,}")
+
+            st.markdown("### Mistake summary")
+            st.dataframe(summary_by_type, use_container_width=True)
+
+            if not summary_by_week.empty:
+                st.markdown("### Weekly mistake damage (top 3 types)")
+                top_types = summary_by_type.head(3)["mistake_type"].tolist()
+                weekly = summary_by_week[summary_by_week["mistake_type"].isin(top_types)]
+                weekly_pivot = weekly.pivot(index="week_key", columns="mistake_type", values="total_damage").fillna(0)
+                st.line_chart(weekly_pivot)
+
+            st.markdown("### Drilldown")
+            type_sel = st.selectbox("Mistake type", summary_by_type["mistake_type"].tolist())
+            examples = examples_by_type[examples_by_type["mistake_type"] == type_sel].head(20).copy()
+            examples["date"] = examples["close_date"].dt.date
+            show_cols = ["date", "underlying", "contract_key", "net_pnl", "severity", "details"]
+            st.dataframe(examples[show_cols], use_container_width=True)
+
+            if not examples.empty:
+                ex_idx = st.selectbox(
+                    "Inspect example row",
+                    examples.index.tolist(),
+                    format_func=lambda i: f"{examples.loc[i, 'date']} | {examples.loc[i, 'details']}",
+                )
+                selected = examples.loc[ex_idx]
+                trades_view = trades_sheet.copy()
+                trades_view["close_date"] = trades_view[["buy_date", "sell_date"]].max(axis=1)
+                trades_view["contract_key"] = _contract_key(trades_view)
+
+                if type_sel == "Overtrading day":
+                    trades_view = trades_view[trades_view["close_date"].dt.date == selected["date"]]
+                elif type_sel == "Gave back gains in ticker":
+                    trades_view = trades_view[trades_view["underlying"] == selected["underlying"]]
+                elif type_sel == "Big loss outlier":
+                    trades_view = trades_view[trades_view["trade_id"] == selected["trade_id"]]
+                elif type_sel == "Averaged down (added to loser)":
+                    trades_view = trades_view[trades_view["contract_key"] == selected["contract_key"]]
+                elif type_sel == "Held losers longer":
+                    trades_view = trades_view
+
+                st.markdown("#### Related closed trades")
+                st.dataframe(trades_view.sort_values("close_date"), use_container_width=True)
+
+            if "losers" in held_tables and "winners" in held_tables:
+                st.markdown("### Holding time contrast")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Longest held losers**")
+                    st.dataframe(held_tables["losers"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
+                with c2:
+                    st.markdown("**Longest held winners**")
+                    st.dataframe(held_tables["winners"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
+
+        if trades_sheet[["buy_date", "sell_date"]].isna().any().any():
+            st.caption("Need open_date from FIFO pairing to compute holding time.")
 
 # -------------------------
 # Actionable recommendations (based on THIS file)
