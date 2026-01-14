@@ -162,6 +162,7 @@ class Lot:
     fees: float
     date: pd.Timestamp
     side: str
+    multiplier: float
 
 def fifo_match(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     buys: List[Lot] = []
@@ -169,7 +170,14 @@ def fifo_match(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     closed = []
 
     for _, r in trades.iterrows():
-        lot = Lot(qty=int(r["qty"]), price=float(r["price"]), fees=float(r["fees"]), date=r["trade_dt"], side=r["side"])
+        lot = Lot(
+            qty=int(r["qty"]),
+            price=float(r["price"]),
+            fees=float(r["fees"]),
+            date=r["trade_dt"],
+            side=r["side"],
+            multiplier=float(r["multiplier"]),
+        )
         if lot.side == "BUY":
             buys.append(lot)
         else:
@@ -181,7 +189,7 @@ def fifo_match(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 return False
             b, s = buys[0], sells[0]
             mqty = min(b.qty, s.qty)
-            multiplier = float(r["multiplier"])
+            multiplier = float(b.multiplier if b.multiplier is not None else s.multiplier)
 
             gross = (s.price - b.price) * mqty * multiplier
             b_fee = b.fees * (mqty / b.qty) if b.qty else 0.0
@@ -211,9 +219,23 @@ def fifo_match(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     open_rows = []
     for lot in buys:
-        open_rows.append({"side": "BUY", "qty": lot.qty, "price": lot.price, "fees": lot.fees, "date": lot.date})
+        open_rows.append({
+            "side": "BUY",
+            "qty": lot.qty,
+            "price": lot.price,
+            "fees": lot.fees,
+            "date": lot.date,
+            "multiplier": lot.multiplier,
+        })
     for lot in sells:
-        open_rows.append({"side": "SELL", "qty": lot.qty, "price": lot.price, "fees": lot.fees, "date": lot.date})
+        open_rows.append({
+            "side": "SELL",
+            "qty": lot.qty,
+            "price": lot.price,
+            "fees": lot.fees,
+            "date": lot.date,
+            "multiplier": lot.multiplier,
+        })
 
     return pd.DataFrame(closed), pd.DataFrame(open_rows)
 
@@ -420,6 +442,13 @@ closed = pd.concat(closed_all, ignore_index=True) if closed_all else pd.DataFram
 openpos = pd.concat(open_all, ignore_index=True) if open_all else pd.DataFrame()
 
 st.subheader("Results")
+pnl_view = st.radio(
+    "P&L view",
+    ["Closed only (realized)", "Closed + Open (separate)"],
+    horizontal=True,
+)
+show_open = pnl_view == "Closed + Open (separate)"
+
 if not closed.empty:
     c1, c2, c3 = st.columns(3)
     c1.metric("Realized net P&L (closed only)", f"${closed['net_pnl'].sum():,.2f}")
@@ -429,8 +458,21 @@ else:
     st.warning("No closed trades detected after FIFO matching (you may only have open positions).")
 
 if not openpos.empty:
-    st.markdown("### Open positions (excluded from realized totals)")
-    st.dataframe(openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]), use_container_width=True)
+    side_sign = np.where(openpos["side"] == "SELL", 1.0, -1.0)
+    openpos["net_premium"] = (openpos["price"] * openpos["qty"] * openpos["multiplier"] * side_sign) - openpos["fees"]
+
+if show_open:
+    if not openpos.empty:
+        st.markdown("### Open positions (unrealized, shown separately)")
+        o1, o2 = st.columns(2)
+        o1.metric("Open premium (cashflow, not P&L)", f"${openpos['net_premium'].sum():,.2f}")
+        o2.metric("Open lots", f"{len(openpos):,}")
+        st.dataframe(
+            openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]),
+            use_container_width=True,
+        )
+    else:
+        st.info("No open positions to show separately.")
 
 trades_sheet = closed.copy() if not closed.empty else pd.DataFrame()
 spy_trades = trades_sheet[trades_sheet["underlying"] == "SPY"].copy() if not trades_sheet.empty else pd.DataFrame()
