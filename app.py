@@ -565,11 +565,28 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
     month_pnl = float(month_df["day_pnl"].sum()) if not month_df.empty else 0.0
     green_days = int((month_df["day_pnl"] > 0).sum()) if not month_df.empty else 0
     red_days = int((month_df["day_pnl"] < 0).sum()) if not month_df.empty else 0
+    trading_days = int(month_df["trade_day"].nunique()) if not month_df.empty else 0
+    avg_day_pnl = (month_pnl / trading_days) if trading_days else 0.0
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Month net P&L", f"${month_pnl:,.0f}")
-    m2.metric("Green days", f"{green_days:,}")
-    m3.metric("Red days", f"{red_days:,}")
+    render_stat_cards(
+        [
+            {
+                "label": "Month net P&L",
+                "value": f"${month_pnl:,.0f}",
+                "sub": f"Avg per trading day: ${avg_day_pnl:,.0f}",
+            },
+            {
+                "label": "Green days",
+                "value": f"{green_days:,}",
+                "sub": f"Trading days: {trading_days:,}",
+            },
+            {
+                "label": "Red days",
+                "value": f"{red_days:,}",
+                "sub": "Closed-day results",
+            },
+        ]
+    )
 
     abs_max = float(month_df["day_pnl"].abs().max()) if not month_df.empty else 0.0
     first_weekday, num_days = calendar.monthrange(year, month)
@@ -1209,6 +1226,36 @@ else:
                             net_pnl=("net_pnl","sum"), avg_pnl=("net_pnl","mean"))
                        )
             st.dataframe(by_hold, use_container_width=True)
+
+        st.markdown("#### Timing performance")
+        f["close_day_name"] = f["close_date"].dt.day_name()
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        by_day = (f.groupby("close_day_name", as_index=False)
+                  .agg(trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum"), avg_pnl=("net_pnl", "mean")))
+        by_day["close_day_name"] = pd.Categorical(by_day["close_day_name"], categories=day_order, ordered=True)
+        by_day = by_day.sort_values("close_day_name")
+
+        f["close_hour"] = f["close_date"].dt.hour.fillna(0).astype(int)
+        by_hour = (f.groupby("close_hour", as_index=False)
+                   .agg(trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum"), avg_pnl=("net_pnl", "mean"))
+                   .sort_values("close_hour"))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Net P&L by day of week**")
+            st.bar_chart(by_day.set_index("close_day_name")["net_pnl"])
+        with c2:
+            st.markdown("**Net P&L by hour of day**")
+            st.bar_chart(by_hour.set_index("close_hour")["net_pnl"])
+
+        st.markdown("#### P&L distribution per trade")
+        if f["net_pnl"].nunique() > 1:
+            hist_vals, bin_edges = np.histogram(f["net_pnl"], bins=20)
+            bin_labels = [f"{bin_edges[i]:.0f} to {bin_edges[i + 1]:.0f}" for i in range(len(bin_edges) - 1)]
+            hist_df = pd.DataFrame({"P&L bucket": bin_labels, "Trades": hist_vals})
+            st.bar_chart(hist_df.set_index("P&L bucket")["Trades"])
+        else:
+            st.info("Not enough variation in trade P&L to build a distribution chart.")
 
         st.markdown("#### Where you make/lose money")
         c1, c2 = st.columns(2)
