@@ -519,10 +519,8 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
     st.markdown(
         """
         <style>
-        .pnl-card-link {
-            display: block;
-            text-decoration: none;
-            color: inherit;
+        .pnl-card-form {
+            margin: 0;
         }
         .pnl-card {
             border-radius: 8px;
@@ -530,6 +528,10 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
             min-height: 82px;
             border: 1px solid rgba(0, 0, 0, 0.06);
             box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            color: #111111;
         }
         .pnl-card .day {
             font-weight: 600;
@@ -542,9 +544,9 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
         }
         .pnl-card .trades {
             font-size: 0.65rem;
-            color: #333333;
+            color: #222222;
         }
-        .pnl-card-link:hover .pnl-card {
+        .pnl-card:hover {
             border-color: rgba(0, 0, 0, 0.18);
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
@@ -606,13 +608,14 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
                 pnl_label = f"${day_pnl:,.0f}"
                 day_param = day_date.isoformat()
                 card_html = f"""
-                <a class="pnl-card-link" href="?selected_day={day_param}">
-                    <div class="pnl-card" style="background: {bg_color};">
+                <form class="pnl-card-form" action="" method="get">
+                    <input type="hidden" name="selected_day" value="{day_param}" />
+                    <button class="pnl-card" type="submit" style="background: {bg_color};">
                         <div class="day">{day}</div>
                         <div class="pnl">{pnl_label}</div>
                         <div class="trades">Trades: {trade_count}</div>
-                    </div>
-                </a>
+                    </button>
+                </form>
                 """
                 st.markdown(card_html, unsafe_allow_html=True)
 
