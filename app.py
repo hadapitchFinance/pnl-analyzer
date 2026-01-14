@@ -1,10 +1,10 @@
-
+import calendar
 import csv
 import io
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -458,6 +458,146 @@ def detect_mistakes(closed_trades: pd.DataFrame, fills: Optional[pd.DataFrame]) 
     }
 
 # -------------------------
+# Daily P&L calendar helpers
+# -------------------------
+def compute_daily_pnl(closed_trades: pd.DataFrame) -> pd.DataFrame:
+    if closed_trades.empty:
+        return pd.DataFrame(columns=["trade_day", "day_pnl", "trade_count", "win_count", "loss_count"])
+
+    base = closed_trades.copy()
+    base["close_date"] = pd.to_datetime(base["close_date"], errors="coerce")
+    base["net_pnl"] = pd.to_numeric(base["net_pnl"], errors="coerce").fillna(0.0)
+    base = base[base["close_date"].notna()]
+    base["trade_day"] = base["close_date"].dt.date
+
+    daily = (base.groupby("trade_day", as_index=False)
+             .agg(day_pnl=("net_pnl", "sum"),
+                  trade_count=("net_pnl", "size"),
+                  win_count=("net_pnl", lambda s: int((s > 0).sum())),
+                  loss_count=("net_pnl", lambda s: int((s < 0).sum()))))
+    return daily
+
+def apply_day_filter(closed_trades: pd.DataFrame, selected_day: Optional[date]) -> pd.DataFrame:
+    if closed_trades.empty or selected_day is None:
+        return closed_trades
+    base = closed_trades.copy()
+    base["close_date"] = pd.to_datetime(base["close_date"], errors="coerce")
+    return base[base["close_date"].dt.date == selected_day].copy()
+
+def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optional[date]:
+    if daily_pnl_df.empty:
+        st.info("No daily P&L data available for the calendar.")
+        return st.session_state.get("selected_day")
+
+    st.session_state.setdefault("selected_day", None)
+
+    year, month = (int(part) for part in month_yyyy_mm.split("-"))
+    month_df = daily_pnl_df.copy()
+    month_df["trade_day"] = pd.to_datetime(month_df["trade_day"], errors="coerce").dt.date
+    month_df = month_df[month_df["trade_day"].apply(lambda d: pd.notna(d) and d.month == month and d.year == year)]
+
+    month_pnl = float(month_df["day_pnl"].sum()) if not month_df.empty else 0.0
+    green_days = int((month_df["day_pnl"] > 0).sum()) if not month_df.empty else 0
+    red_days = int((month_df["day_pnl"] < 0).sum()) if not month_df.empty else 0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Month net P&L", f"${month_pnl:,.0f}")
+    m2.metric("Green days", f"{green_days:,}")
+    m3.metric("Red days", f"{red_days:,}")
+
+    abs_max = float(month_df["day_pnl"].abs().max()) if not month_df.empty else 0.0
+    first_weekday, num_days = calendar.monthrange(year, month)
+
+    day_lookup = {
+        row["trade_day"]: {
+            "day_pnl": float(row["day_pnl"]),
+            "trade_count": int(row["trade_count"]),
+        }
+        for _, row in month_df.iterrows()
+    }
+
+    st.markdown(
+        """
+        <style>
+        .pnl-card {
+            border-radius: 10px;
+            padding: 0.6rem;
+            min-height: 110px;
+            border: 1px solid rgba(0, 0, 0, 0.06);
+            box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+        }
+        .pnl-card .day {
+            font-weight: 600;
+            margin-bottom: 0.35rem;
+        }
+        .pnl-card .pnl {
+            font-size: 0.95rem;
+            margin-bottom: 0.2rem;
+        }
+        .pnl-card .trades {
+            font-size: 0.8rem;
+            color: #333333;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**Mon** | **Tue** | **Wed** | **Thu** | **Fri** | **Sat** | **Sun**")
+    day_num = 1
+    weeks = []
+    week = [None] * first_weekday
+    while day_num <= num_days:
+        week.append(day_num)
+        if len(week) == 7:
+            weeks.append(week)
+            week = []
+        day_num += 1
+    if week:
+        week.extend([None] * (7 - len(week)))
+        weeks.append(week)
+
+    for week in weeks:
+        cols = st.columns(7)
+        for idx, day in enumerate(week):
+            with cols[idx]:
+                if day is None:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    continue
+
+                day_date = date(year, month, day)
+                data = day_lookup.get(day_date)
+                day_pnl = data["day_pnl"] if data else 0.0
+                trade_count = data["trade_count"] if data else 0
+
+                if data is None:
+                    bg_color = "rgba(230, 230, 230, 0.6)"
+                else:
+                    intensity = abs(day_pnl) / abs_max if abs_max else 0.0
+                    alpha = 0.18 + (0.45 * min(1.0, intensity))
+                    if day_pnl > 0:
+                        bg_color = f"rgba(46, 204, 113, {alpha:.2f})"
+                    elif day_pnl < 0:
+                        bg_color = f"rgba(231, 76, 60, {alpha:.2f})"
+                    else:
+                        bg_color = "rgba(220, 220, 220, 0.6)"
+
+                pnl_label = f"${day_pnl:,.0f}"
+                card_html = f"""
+                <div class="pnl-card" style="background: {bg_color};">
+                    <div class="day">{day}</div>
+                    <div class="pnl">{pnl_label}</div>
+                    <div class="trades">Trades: {trade_count}</div>
+                </div>
+                """
+                st.markdown(card_html, unsafe_allow_html=True)
+
+                if st.button("Select day", key=f"pnl-day-{day_date}", use_container_width=True):
+                    st.session_state["selected_day"] = day_date
+
+    return st.session_state.get("selected_day")
+
+# -------------------------
 # Broker detection + normalization
 # -------------------------
 def detect_broker(columns: List[str]) -> str:
@@ -704,6 +844,77 @@ spy_total = float(spy_trades["net_pnl"].sum()) if not spy_trades.empty else 0.0
 with st.expander("Insights", expanded=True):
     if trades_sheet.empty:
         st.info("No closed trades to analyze for insights (only open positions found).")
+st.subheader("Insights")
+
+if trades_sheet.empty:
+    st.info("No closed trades to analyze for insights (only open positions found).")
+else:
+    # Add derived fields
+    ts = trades_sheet.copy()
+    ts["open_date"] = ts[["buy_date", "sell_date"]].min(axis=1)
+    ts["close_date"] = ts[["buy_date", "sell_date"]].max(axis=1)
+    ts["hold_days"] = (ts["close_date"] - ts["open_date"]).dt.total_seconds() / (24 * 3600)
+    ts["position_type"] = np.where(ts["sell_date"] < ts["buy_date"], "SHORT", "LONG")
+
+    st.markdown("### Daily P&L Calendar")
+    realized_only = st.toggle("Realized only", value=True)
+    if not realized_only:
+        st.info("All (open/unrealized) calendar view is not available yet. Showing realized only.")
+
+    daily_pnl = compute_daily_pnl(ts)
+    if daily_pnl.empty:
+        st.info("No closed trades available to build the daily calendar.")
+    else:
+        daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
+        month_options = sorted(daily_pnl["month"].unique().tolist())
+        default_month = pd.to_datetime(ts["close_date"]).max().strftime("%Y-%m")
+        default_index = month_options.index(default_month) if default_month in month_options else len(month_options) - 1
+
+        month_sel = st.selectbox("Month", options=month_options, index=default_index)
+        selected_day = render_pnl_calendar(daily_pnl, month_sel)
+
+        if selected_day:
+            st.markdown(f"#### Trades closed on {selected_day:%Y-%m-%d}")
+            filtered_day = apply_day_filter(ts, selected_day)
+            if st.button("Clear day filter"):
+                st.session_state["selected_day"] = None
+            st.dataframe(
+                filtered_day.sort_values("close_date", ascending=False),
+                use_container_width=True,
+            )
+
+    # Filters
+    with st.expander("Filters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            under_sel = st.multiselect("Underlying", options=sorted(ts["underlying"].unique().tolist()),
+                                       default=sorted(ts["underlying"].unique().tolist()))
+        with c2:
+            right_sel = st.multiselect("Type (C/P)", options=sorted(ts["right"].unique().tolist()),
+                                       default=sorted(ts["right"].unique().tolist()))
+        with c3:
+            pos_sel = st.multiselect("Position (SHORT/LONG)", options=sorted(ts["position_type"].unique().tolist()),
+                                     default=sorted(ts["position_type"].unique().tolist()))
+        with c4:
+            dmin = ts["close_date"].min().date()
+            dmax = ts["close_date"].max().date()
+            date_range = st.date_input("Close date range", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        d0, d1 = date_range
+    else:
+        d0 = dmin; d1 = dmax
+
+    f = ts[
+        ts["underlying"].isin(under_sel)
+        & ts["right"].isin(right_sel)
+        & ts["position_type"].isin(pos_sel)
+        & (ts["close_date"].dt.date >= d0)
+        & (ts["close_date"].dt.date <= d1)
+    ].copy()
+
+    if f.empty:
+        st.warning("No trades match your filters.")
     else:
         # Add derived fields
         ts = trades_sheet.copy()
