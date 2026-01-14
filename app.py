@@ -919,58 +919,18 @@ else:
     if f.empty:
         st.warning("No trades match your filters.")
     else:
-        # Add derived fields
-        ts = trades_sheet.copy()
-        ts["open_date"] = ts[["buy_date", "sell_date"]].min(axis=1)
-        ts["close_date"] = ts[["buy_date", "sell_date"]].max(axis=1)
-        ts["hold_days"] = (ts["close_date"] - ts["open_date"]).dt.total_seconds() / (24 * 3600)
-        ts["position_type"] = np.where(ts["sell_date"] < ts["buy_date"], "SHORT", "LONG")
+        wins = f[f["net_pnl"] > 0]["net_pnl"]
+        losses = f[f["net_pnl"] < 0]["net_pnl"]
 
-        # Filters
-        with st.expander("Filters", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                under_sel = st.multiselect("Underlying", options=sorted(ts["underlying"].unique().tolist()),
-                                           default=sorted(ts["underlying"].unique().tolist()))
-            with c2:
-                right_sel = st.multiselect("Type (C/P)", options=sorted(ts["right"].unique().tolist()),
-                                           default=sorted(ts["right"].unique().tolist()))
-            with c3:
-                pos_sel = st.multiselect("Position (SHORT/LONG)", options=sorted(ts["position_type"].unique().tolist()),
-                                         default=sorted(ts["position_type"].unique().tolist()))
-            with c4:
-                dmin = ts["close_date"].min().date()
-                dmax = ts["close_date"].max().date()
-                date_range = st.date_input("Close date range", value=(dmin, dmax), min_value=dmin, max_value=dmax)
-
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            d0, d1 = date_range
-        else:
-            d0 = dmin; d1 = dmax
-
-        f = ts[
-            ts["underlying"].isin(under_sel)
-            & ts["right"].isin(right_sel)
-            & ts["position_type"].isin(pos_sel)
-            & (ts["close_date"].dt.date >= d0)
-            & (ts["close_date"].dt.date <= d1)
-        ].copy()
-
-        if f.empty:
-            st.warning("No trades match your filters.")
-        else:
-            wins = f[f["net_pnl"] > 0]["net_pnl"]
-            losses = f[f["net_pnl"] < 0]["net_pnl"]
-
-            total_net = float(f["net_pnl"].sum())
-            total_gross = float(f["gross_pnl"].sum())
-            total_fees = float(f["fees"].sum())
-            n = len(f)
-            win_rate = float((f["net_pnl"] > 0).mean()) if n else 0.0
-            avg = float(f["net_pnl"].mean()) if n else 0.0
-            med = float(f["net_pnl"].median()) if n else 0.0
-            avg_win = float(wins.mean()) if len(wins) else 0.0
-            avg_loss = float(losses.mean()) if len(losses) else 0.0
+        total_net = float(f["net_pnl"].sum())
+        total_gross = float(f["gross_pnl"].sum())
+        total_fees = float(f["fees"].sum())
+        n = len(f)
+        win_rate = float((f["net_pnl"] > 0).mean()) if n else 0.0
+        avg = float(f["net_pnl"].mean()) if n else 0.0
+        med = float(f["net_pnl"].median()) if n else 0.0
+        avg_win = float(wins.mean()) if len(wins) else 0.0
+        avg_loss = float(losses.mean()) if len(losses) else 0.0
         payoff = (avg_win / abs(avg_loss)) if (avg_win and avg_loss) else np.nan
         profit_factor = (wins.sum() / abs(losses.sum())) if len(losses) and len(wins) else np.nan
         expectancy = avg  # same as avg net per closed match
