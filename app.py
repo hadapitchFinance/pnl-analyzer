@@ -951,15 +951,9 @@ else:
     st.error("Could not auto-detect broker. Choose Fidelity or IBKR.")
     st.stop()
 
-with st.expander("Parsed trades preview", expanded=True):
-    if work is None or work.empty:
-        st.warning("No trades parsed from this file.")
-        st.stop()
-
-    st.dataframe(
-        work[["trade_dt", "asset_type", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80),
-        use_container_width=True,
-    )
+if work is None or work.empty:
+    st.warning("No trades parsed from this file.")
+    st.stop()
 
 # FIFO per contract
 closed_all = []
@@ -987,64 +981,64 @@ for cid, g in work.groupby("contract_id", sort=False):
 closed = pd.concat(closed_all, ignore_index=True) if closed_all else pd.DataFrame()
 openpos = pd.concat(open_all, ignore_index=True) if open_all else pd.DataFrame()
 
-with st.expander("Results", expanded=True):
-    pnl_view = st.radio(
-        "P&L view",
-        ["Closed only (realized)", "Closed + Open (separate)"],
-        horizontal=True,
-    )
-    show_open = pnl_view == "Closed + Open (separate)"
+st.header("1) Summary metrics")
+pnl_view = st.radio(
+    "P&L view",
+    ["Closed only (realized)", "Closed + Open (separate)"],
+    horizontal=True,
+)
+show_open = pnl_view == "Closed + Open (separate)"
 
-    if not closed.empty:
+if not closed.empty:
+    render_stat_cards(
+        [
+            {
+                "label": "Realized net P&L",
+                "value": f"${closed['net_pnl'].sum():,.2f}",
+                "sub": "Closed trades only",
+            },
+            {
+                "label": "Closed matches",
+                "value": f"{len(closed):,}",
+                "sub": "FIFO matched",
+            },
+            {
+                "label": "Win rate",
+                "value": f"{(closed['net_pnl'] > 0).mean() * 100:,.1f}%",
+                "sub": "Closed trades",
+            },
+        ]
+    )
+else:
+    st.warning("No closed trades detected after FIFO matching (you may only have open positions).")
+
+if not openpos.empty:
+    side_sign = np.where(openpos["side"] == "SELL", 1.0, -1.0)
+    openpos["net_premium"] = (openpos["price"] * openpos["qty"] * openpos["multiplier"] * side_sign) - openpos["fees"]
+
+if show_open:
+    if not openpos.empty:
+        st.markdown("### Open positions (unrealized, shown separately)")
         render_stat_cards(
             [
                 {
-                    "label": "Realized net P&L",
-                    "value": f"${closed['net_pnl'].sum():,.2f}",
-                    "sub": "Closed trades only",
+                    "label": "Open premium",
+                    "value": f"${openpos['net_premium'].sum():,.2f}",
+                    "sub": "Cashflow, not P&L",
                 },
                 {
-                    "label": "Closed matches",
-                    "value": f"{len(closed):,}",
-                    "sub": "FIFO matched",
-                },
-                {
-                    "label": "Win rate",
-                    "value": f"{(closed['net_pnl'] > 0).mean() * 100:,.1f}%",
-                    "sub": "Closed trades",
+                    "label": "Open lots",
+                    "value": f"{len(openpos):,}",
+                    "sub": "Positions still open",
                 },
             ]
         )
+        st.dataframe(
+            openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]),
+            use_container_width=True,
+        )
     else:
-        st.warning("No closed trades detected after FIFO matching (you may only have open positions).")
-
-    if not openpos.empty:
-        side_sign = np.where(openpos["side"] == "SELL", 1.0, -1.0)
-        openpos["net_premium"] = (openpos["price"] * openpos["qty"] * openpos["multiplier"] * side_sign) - openpos["fees"]
-
-    if show_open:
-        if not openpos.empty:
-            st.markdown("### Open positions (unrealized, shown separately)")
-            render_stat_cards(
-                [
-                    {
-                        "label": "Open premium",
-                        "value": f"${openpos['net_premium'].sum():,.2f}",
-                        "sub": "Cashflow, not P&L",
-                    },
-                    {
-                        "label": "Open lots",
-                        "value": f"{len(openpos):,}",
-                        "sub": "Positions still open",
-                    },
-                ]
-            )
-            st.dataframe(
-                openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]),
-                use_container_width=True,
-            )
-        else:
-            st.info("No open positions to show separately.")
+        st.info("No open positions to show separately.")
 
 trades_sheet = closed.copy().reset_index(drop=True) if not closed.empty else pd.DataFrame()
 if not trades_sheet.empty:
@@ -1055,10 +1049,7 @@ spy_total = float(spy_trades["net_pnl"].sum()) if not spy_trades.empty else 0.0
 # -------------------------
 # Insights (out-of-the-box)
 # -------------------------
-with st.expander("Insights", expanded=True):
-    if trades_sheet.empty:
-        st.info("No closed trades to analyze for insights (only open positions found).")
-st.subheader("Insights")
+st.header("2) Insights")
 
 if trades_sheet.empty:
     st.info("No closed trades to analyze for insights (only open positions found).")
@@ -1306,6 +1297,11 @@ else:
                     cur = 0
             return best
         st.caption(f"Max win streak: **{max_streak(outcomes, True)}** | Max loss streak: **{max_streak(outcomes, False)}**")
+
+# -------------------------
+# Diagnostics & recommendations
+# -------------------------
+st.header("3) Diagnostics & recommendations")
 
 # -------------------------
 # Mistake detector
@@ -1648,9 +1644,13 @@ with st.expander("Actionable recommendations", expanded=True):
                        "or because net P&L is near the middle of the distribution. Use trades, win rate, and avg P&L to "
                        "decide whether the segment is truly strong or weak.")
 
+st.header("4) Data tables & export")
 
-
-
+with st.expander("Parsed trades (raw)", expanded=False):
+    st.dataframe(
+        work[["trade_dt", "asset_type", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80),
+        use_container_width=True,
+    )
 
 if not trades_sheet.empty:
     with st.expander("Dashboard (realized)", expanded=False):
