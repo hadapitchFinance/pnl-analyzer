@@ -519,24 +519,34 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
     st.markdown(
         """
         <style>
+        .pnl-card-link {
+            display: block;
+            text-decoration: none;
+            color: inherit;
+        }
         .pnl-card {
-            border-radius: 10px;
-            padding: 0.6rem;
-            min-height: 110px;
+            border-radius: 8px;
+            padding: 0.45rem;
+            min-height: 82px;
             border: 1px solid rgba(0, 0, 0, 0.06);
             box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
         }
         .pnl-card .day {
             font-weight: 600;
-            margin-bottom: 0.35rem;
+            font-size: 0.85rem;
+            margin-bottom: 0.25rem;
         }
         .pnl-card .pnl {
-            font-size: 0.95rem;
-            margin-bottom: 0.2rem;
+            font-size: 0.8rem;
+            margin-bottom: 0.15rem;
         }
         .pnl-card .trades {
-            font-size: 0.8rem;
+            font-size: 0.65rem;
             color: #333333;
+        }
+        .pnl-card-link:hover .pnl-card {
+            border-color: rgba(0, 0, 0, 0.18);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
         </style>
         """,
@@ -559,6 +569,14 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
     if week:
         week.extend([None] * (7 - len(week)))
         weeks.append(week)
+
+    query_params = st.experimental_get_query_params()
+    selected_day_param = query_params.get("selected_day", [None])[0]
+    if selected_day_param:
+        try:
+            st.session_state["selected_day"] = date.fromisoformat(selected_day_param)
+        except ValueError:
+            pass
 
     for week in weeks:
         cols = st.columns(7)
@@ -586,17 +604,17 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
                         bg_color = "rgba(220, 220, 220, 0.6)"
 
                 pnl_label = f"${day_pnl:,.0f}"
+                day_param = day_date.isoformat()
                 card_html = f"""
-                <div class="pnl-card" style="background: {bg_color};">
-                    <div class="day">{day}</div>
-                    <div class="pnl">{pnl_label}</div>
-                    <div class="trades">Trades: {trade_count}</div>
-                </div>
+                <a class="pnl-card-link" href="?selected_day={day_param}">
+                    <div class="pnl-card" style="background: {bg_color};">
+                        <div class="day">{day}</div>
+                        <div class="pnl">{pnl_label}</div>
+                        <div class="trades">Trades: {trade_count}</div>
+                    </div>
+                </a>
                 """
                 st.markdown(card_html, unsafe_allow_html=True)
-
-                if st.button("Select day", key=f"pnl-day-{day_date}", use_container_width=True):
-                    st.session_state["selected_day"] = day_date
 
     return st.session_state.get("selected_day")
 
