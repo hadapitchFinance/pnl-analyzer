@@ -543,7 +543,10 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
         unsafe_allow_html=True,
     )
 
-    st.markdown("**Mon** | **Tue** | **Wed** | **Thu** | **Fri** | **Sat** | **Sun**")
+    header_cols = st.columns(7)
+    for col, label in zip(header_cols, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+        with col:
+            st.markdown(f"**{label}**")
     day_num = 1
     weeks = []
     week = [None] * first_weekday
