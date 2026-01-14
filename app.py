@@ -30,6 +30,16 @@ if APP_PASS:
 
 DATE_LINE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{4}\s*,")
 HEADER_RE = re.compile(r"^\s*Run Date\s*,", re.IGNORECASE)
+POST_MORTEM_TAGS = [
+    "Entered too early / chased",
+    "Held too long",
+    "Wrong thesis / news",
+    "Position size too big",
+    "Didn’t cut at stop",
+    "IV crush / earnings",
+    "Rolled to avoid loss",
+]
+UNASSIGNED_TAG = "(unassigned)"
 
 def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
     """
@@ -474,7 +484,9 @@ if show_open:
     else:
         st.info("No open positions to show separately.")
 
-trades_sheet = closed.copy() if not closed.empty else pd.DataFrame()
+trades_sheet = closed.copy().reset_index(drop=True) if not closed.empty else pd.DataFrame()
+if not trades_sheet.empty:
+    trades_sheet["trade_id"] = trades_sheet.index.astype(str)
 spy_trades = trades_sheet[trades_sheet["underlying"] == "SPY"].copy() if not trades_sheet.empty else pd.DataFrame()
 spy_total = float(spy_trades["net_pnl"].sum()) if not spy_trades.empty else 0.0
 
@@ -630,6 +642,99 @@ else:
                     cur = 0
             return best
         st.caption(f"Max win streak: **{max_streak(outcomes, True)}** | Max loss streak: **{max_streak(outcomes, False)}**")
+
+# -------------------------
+# Actionable recommendations (based on THIS file)
+# -------------------------
+st.subheader("Post-mortem tags + root-cause stats")
+
+if trades_sheet.empty:
+    st.info("No closed trades available to tag yet.")
+else:
+    if "loss_tags" not in st.session_state:
+        st.session_state["loss_tags"] = {}
+
+    losses = trades_sheet[trades_sheet["net_pnl"] < 0].copy()
+    if losses.empty:
+        st.info("No losing trades found in this file.")
+    else:
+        losses["position_type"] = np.where(losses["sell_date"] < losses["buy_date"], "SHORT", "LONG")
+        right_label = losses["right"].map({"C": "Call", "P": "Put"}).fillna(losses["right"])
+        losses["strategy"] = right_label + " " + losses["position_type"].str.title()
+        losses["post_mortem_tag"] = losses["trade_id"].map(st.session_state["loss_tags"]).fillna(UNASSIGNED_TAG)
+
+        edit_cols = [
+            "close_date",
+            "underlying",
+            "expiry",
+            "strike",
+            "right",
+            "position_type",
+            "qty",
+            "net_pnl",
+            "post_mortem_tag",
+        ]
+        edited = st.data_editor(
+            losses.set_index("trade_id")[edit_cols],
+            use_container_width=True,
+            hide_index=True,
+            key="loss_tag_editor",
+            disabled=[c for c in edit_cols if c != "post_mortem_tag"],
+            column_config={
+                "post_mortem_tag": st.column_config.SelectboxColumn(
+                    "Post-mortem tag",
+                    options=[UNASSIGNED_TAG] + POST_MORTEM_TAGS,
+                )
+            },
+        )
+
+        for trade_id, tag in edited["post_mortem_tag"].to_dict().items():
+            if tag and tag != UNASSIGNED_TAG:
+                st.session_state["loss_tags"][trade_id] = tag
+            else:
+                st.session_state["loss_tags"].pop(trade_id, None)
+
+        tagged_losses = losses.drop(columns=["post_mortem_tag"]).merge(
+            edited[["post_mortem_tag"]],
+            left_on="trade_id",
+            right_index=True,
+            how="left",
+        )
+        tagged_losses["post_mortem_tag"] = tagged_losses["post_mortem_tag"].fillna(UNASSIGNED_TAG)
+        tagged_losses["loss_usd"] = -tagged_losses["net_pnl"]
+        tagged = tagged_losses[tagged_losses["post_mortem_tag"] != UNASSIGNED_TAG].copy()
+
+        st.markdown("### Root-cause summary (losing trades)")
+        unassigned = int((tagged_losses["post_mortem_tag"] == UNASSIGNED_TAG).sum())
+        if unassigned:
+            st.caption(f"{unassigned} losing trades are still untagged.")
+
+        if tagged.empty:
+            st.info("Assign tags above to see root-cause stats.")
+        else:
+            summary = (
+                tagged.groupby("post_mortem_tag", as_index=False)
+                .agg(
+                    loss_usd=("loss_usd", "sum"),
+                    count=("net_pnl", "size"),
+                    avg_loss=("net_pnl", "mean"),
+                    tickers=("underlying", lambda s: ", ".join(sorted(set(s)))),
+                    strategies=("strategy", lambda s: ", ".join(sorted(set(s)))),
+                )
+                .sort_values("loss_usd", ascending=False)
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Top 3 loss causes by $**")
+                st.dataframe(summary.head(3), use_container_width=True)
+            with c2:
+                st.markdown("**Top 3 loss causes by count**")
+                by_count = summary.sort_values(["count", "loss_usd"], ascending=[False, False])
+                st.dataframe(by_count.head(3), use_container_width=True)
+
+            st.markdown("**Average loss per cause + tickers/strategies**")
+            st.dataframe(summary, use_container_width=True)
 
 # -------------------------
 # Actionable recommendations (based on THIS file)
