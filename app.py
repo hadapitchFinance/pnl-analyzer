@@ -623,6 +623,10 @@ else:
                 avg_pnl=("net_pnl", "mean"),
                 fees=("fees", "sum"))
            .sort_values("net_pnl", ascending=True))
+    seg = seg.copy()
+    right_label = seg["right"].map({"C": "Call", "P": "Put"}).fillna(seg["right"])
+    seg["segment"] = seg["underlying"] + " " + right_label + " " + seg["position_type"].str.title()
+    seg["segment_key"] = seg["underlying"] + "|" + seg["right"] + "|" + seg["position_type"]
 
     # 3) Size buckets
     def size_bucket(q):
@@ -710,15 +714,36 @@ else:
         st.dataframe(by_size, use_container_width=True)
 
     st.markdown("### Quick “Do more / Do less” lists")
-    top = seg[seg["trades"] >= 3].sort_values("net_pnl", ascending=False).head(10)
-    bot = seg[seg["trades"] >= 3].sort_values("net_pnl", ascending=True).head(10)
+    base_seg = seg[seg["trades"] >= 3].copy()
+    top = base_seg.sort_values("net_pnl", ascending=False).head(10)
+    bot = base_seg.sort_values("net_pnl", ascending=True).head(10)
+    overlap_keys = set(top["segment_key"]).intersection(bot["segment_key"])
+
+    def add_list_flags(df: pd.DataFrame, list_name: str) -> pd.DataFrame:
+        flagged = df.copy()
+        flagged["list_flag"] = np.where(flagged["segment_key"].isin(overlap_keys), "both lists", list_name)
+        return flagged
+
+    top = add_list_flags(top, "top")
+    bot = add_list_flags(bot, "bottom")
     c1, c2 = st.columns(2)
     with c1:
         st.success("Do more of (best segments)")
-        st.dataframe(top, use_container_width=True)
+        top_show = top.drop(columns=["segment_key"])
+        top_show = top_show[["segment", "list_flag", "trades", "win_rate", "net_pnl", "avg_pnl", "fees",
+                             "underlying", "right", "position_type"]]
+        st.dataframe(top_show, use_container_width=True)
     with c2:
         st.error("Do less of (worst segments)")
-        st.dataframe(bot, use_container_width=True)
+        bot_show = bot.drop(columns=["segment_key"])
+        bot_show = bot_show[["segment", "list_flag", "trades", "win_rate", "net_pnl", "avg_pnl", "fees",
+                             "underlying", "right", "position_type"]]
+        st.dataframe(bot_show, use_container_width=True)
+
+    if overlap_keys:
+        st.caption("Segments tagged as “both lists” appear because the list size exceeds the number of unique segments "
+                   "or because net P&L is near the middle of the distribution. Use trades, win rate, and avg P&L to "
+                   "decide whether the segment is truly strong or weak.")
 
 
 
