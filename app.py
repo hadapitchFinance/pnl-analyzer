@@ -1047,6 +1047,198 @@ spy_trades = trades_sheet[trades_sheet["underlying"] == "SPY"].copy() if not tra
 spy_total = float(spy_trades["net_pnl"].sum()) if not spy_trades.empty else 0.0
 
 # -------------------------
+# Advanced stats
+# -------------------------
+st.header("1b) Advanced Stats")
+
+if trades_sheet.empty:
+    st.info("No closed trades available for advanced stats.")
+else:
+    advanced = trades_sheet.copy()
+    advanced["close_time"] = pd.to_datetime(advanced[["buy_date", "sell_date"]].max(axis=1), errors="coerce")
+    advanced = advanced[advanced["close_time"].notna()].copy()
+    advanced = advanced.sort_values("close_time")
+    advanced["pnl"] = pd.to_numeric(advanced["net_pnl"], errors="coerce").fillna(0.0)
+    advanced["fees"] = pd.to_numeric(advanced.get("fees", 0.0), errors="coerce").fillna(0.0)
+    advanced["date"] = advanced["close_time"].dt.date
+    advanced["dow"] = advanced["close_time"].dt.dayofweek
+    advanced["hour"] = advanced["close_time"].dt.hour
+    advanced["symbol"] = advanced["underlying"].astype(str)
+
+    starting_capital = st.number_input(
+        "Starting capital (optional, for Sharpe/Sortino/Kelly %)",
+        min_value=0.0,
+        value=0.0,
+        step=1000.0,
+        format="%.2f",
+    )
+    has_capital = starting_capital > 0
+
+    n_trades = len(advanced)
+    wins = advanced[advanced["pnl"] > 0]["pnl"]
+    losses = advanced[advanced["pnl"] < 0]["pnl"]
+
+    winrate = float((advanced["pnl"] > 0).mean()) if n_trades else 0.0
+    gross_profit = float(wins.sum()) if not wins.empty else 0.0
+    gross_loss = abs(float(losses.sum())) if not losses.empty else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+    expectancy = float(advanced["pnl"].mean()) if n_trades else 0.0
+
+    advanced["equity"] = advanced["pnl"].cumsum()
+    advanced["running_peak"] = advanced["equity"].cummax()
+    advanced["drawdown"] = advanced["equity"] - advanced["running_peak"]
+    max_dd_abs = abs(float(advanced["drawdown"].min())) if n_trades else 0.0
+    max_dd_pct = np.nan
+    if has_capital:
+        equity_with_capital = starting_capital + advanced["equity"]
+        peak = equity_with_capital.cummax()
+        dd_pct = (equity_with_capital - peak) / peak.replace(0, np.nan) * 100
+        max_dd_pct = abs(float(dd_pct.min())) if dd_pct.notna().any() else np.nan
+
+    sharpe_label = "Sharpe (unscaled)"
+    sortino_label = "Sortino (unscaled)"
+    sharpe_value = np.nan
+    sortino_value = np.nan
+    if has_capital:
+        sharpe_label = "Sharpe (daily)"
+        sortino_label = "Sortino (daily)"
+        daily_pnl = advanced.groupby("date", as_index=False)["pnl"].sum()
+        daily_returns = daily_pnl["pnl"] / starting_capital
+        if len(daily_returns) > 1 and daily_returns.std(ddof=1) != 0:
+            sharpe_value = (daily_returns.mean() / daily_returns.std(ddof=1)) * np.sqrt(252)
+        downside = daily_returns[daily_returns < 0]
+        if len(downside) > 1 and downside.std(ddof=1) != 0:
+            sortino_value = (daily_returns.mean() / downside.std(ddof=1)) * np.sqrt(252)
+        elif len(downside) == 0 and len(daily_returns) > 1:
+            sortino_value = np.inf
+    else:
+        returns = advanced["pnl"]
+        if len(returns) > 1 and returns.std(ddof=1) != 0:
+            sharpe_value = returns.mean() / returns.std(ddof=1)
+        downside = returns[returns < 0]
+        if len(downside) > 1 and downside.std(ddof=1) != 0:
+            sortino_value = returns.mean() / downside.std(ddof=1)
+        elif len(downside) == 0 and len(returns) > 1:
+            sortino_value = np.inf
+
+    kelly_pct = np.nan
+    avg_win = float(wins.mean()) if not wins.empty else np.nan
+    avg_loss = abs(float(losses.mean())) if not losses.empty else np.nan
+    if not np.isnan(avg_win) and not np.isnan(avg_loss) and avg_loss > 0:
+        b = avg_win / avg_loss
+        kelly = winrate - (1 - winrate) / b if b > 0 else np.nan
+        if not np.isnan(kelly):
+            kelly_pct = max(kelly, 0) * 100
+
+    if n_trades < 20:
+        st.warning("Stats may be noisy (fewer than 20 closed trades).")
+
+    max_dd_sub = "Absolute drawdown"
+    if has_capital and not np.isnan(max_dd_pct):
+        max_dd_sub = f"Peak-to-trough {max_dd_pct:,.1f}%"
+
+    render_stat_cards(
+        [
+            {
+                "label": "Winrate",
+                "value": f"{winrate * 100:,.1f}%",
+                "sub": "Closed trades only",
+            },
+            {
+                "label": "Profit factor",
+                "value": f"{profit_factor:,.2f}" if np.isfinite(profit_factor) else "∞",
+                "sub": "Gross wins / losses",
+            },
+            {
+                "label": "Expectancy",
+                "value": f"${expectancy:,.2f}",
+                "sub": "Avg P&L per trade",
+            },
+            {
+                "label": "Max drawdown",
+                "value": f"${max_dd_abs:,.2f}",
+                "sub": max_dd_sub,
+            },
+            {
+                "label": sharpe_label,
+                "value": "N/A" if np.isnan(sharpe_value) else f"{sharpe_value:,.2f}",
+                "sub": "Provide capital for scaled" if not has_capital else "Annualized",
+            },
+            {
+                "label": sortino_label,
+                "value": "N/A" if np.isnan(sortino_value) else ("∞" if np.isinf(sortino_value) else f"{sortino_value:,.2f}"),
+                "sub": "Downside deviation",
+            },
+            {
+                "label": "Kelly %",
+                "value": "N/A" if np.isnan(kelly_pct) else f"{kelly_pct:,.1f}%",
+                "sub": "Sizing guide only",
+            },
+        ]
+    )
+    st.caption("Kelly sizing note: practical position sizing often uses ¼–½ Kelly.")
+
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        st.markdown("#### Equity curve (closed trades)")
+        st.line_chart(advanced.set_index("close_time")["equity"])
+    with chart_cols[1]:
+        st.markdown("#### P&L distribution per trade")
+        if advanced["pnl"].nunique() > 1:
+            hist_vals, bin_edges = np.histogram(advanced["pnl"], bins=25)
+            bin_labels = [f"{bin_edges[i]:.0f} to {bin_edges[i + 1]:.0f}" for i in range(len(bin_edges) - 1)]
+            hist_df = pd.DataFrame({"P&L bucket": bin_labels, "Trades": hist_vals})
+            st.bar_chart(hist_df.set_index("P&L bucket")["Trades"])
+        else:
+            st.info("Not enough P&L variation to build a histogram.")
+
+    st.markdown("#### Time-of-week performance")
+    day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    by_dow = (advanced.groupby("dow", as_index=False)
+              .agg(net_pnl=("pnl", "sum")))
+    by_dow["dow"] = by_dow["dow"].map({i: day_order[i] for i in range(7)})
+    by_dow["dow"] = pd.Categorical(by_dow["dow"], categories=day_order, ordered=True)
+    by_dow = by_dow.sort_values("dow")
+
+    by_hour = (advanced.groupby("hour", as_index=False)
+               .agg(net_pnl=("pnl", "sum"))
+               .sort_values("hour"))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Net P&L by day of week**")
+        st.bar_chart(by_dow.set_index("dow")["net_pnl"])
+    with c2:
+        st.markdown("**Net P&L by hour of day**")
+        st.bar_chart(by_hour.set_index("hour")["net_pnl"])
+        if advanced["close_time"].dt.tz is None:
+            st.caption("Hour-of-day uses local time from the data (timezone not provided).")
+
+    st.markdown("#### Stats by market")
+    by_symbol = (advanced.groupby("symbol", as_index=False)
+                 .agg(
+                     trades=("pnl", "size"),
+                     total_pnl=("pnl", "sum"),
+                     winrate=("pnl", lambda s: float((s > 0).mean())),
+                     expectancy=("pnl", "mean"),
+                     gross_profit=("pnl", lambda s: float(s[s > 0].sum())),
+                     gross_loss=("pnl", lambda s: abs(float(s[s < 0].sum()))),
+                 ))
+    by_symbol["profit_factor"] = by_symbol.apply(
+        lambda r: r["gross_profit"] / r["gross_loss"] if r["gross_loss"] > 0 else np.inf,
+        axis=1,
+    )
+    by_symbol = by_symbol.drop(columns=["gross_profit", "gross_loss"]).sort_values("total_pnl", ascending=False)
+    by_symbol["winrate"] = by_symbol["winrate"] * 100
+    st.dataframe(
+        by_symbol,
+        use_container_width=True,
+        column_config={
+            "winrate": st.column_config.NumberColumn("winrate (%)", format="%.1f"),
+        },
+    )
+
+# -------------------------
 # Insights (out-of-the-box)
 # -------------------------
 st.header("2) Insights")
