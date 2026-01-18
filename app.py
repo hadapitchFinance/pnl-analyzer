@@ -138,6 +138,617 @@ def render_status_cards(items: List[Dict[str, str]]) -> None:
     )
     st.markdown(f"<div class='dashboard-grid'>{cards}</div>", unsafe_allow_html=True)
 
+def set_nav_tab(tab_name: str) -> None:
+    st.session_state["nav_tab"] = tab_name
+
+def render_header_controls() -> Dict[str, Any]:
+    st.title("Trade Analyzer Pro")
+    st.caption("Upload Fidelity or IBKR fills. The app reconciles, dedupes, and separates realized vs unrealized results.")
+
+    settings = st.session_state.get("settings", {})
+    toggles = settings.get("toggles", {})
+    include_stocks = st.toggle(
+        "Include stock trades in P&L calculations",
+        value=bool(toggles.get("include_stocks", False)),
+        help="When enabled, equity trades are included alongside options.",
+        key="include_stocks_toggle",
+    )
+    toggles["include_stocks"] = include_stocks
+    settings["toggles"] = toggles
+    st.session_state["settings"] = settings
+
+    uploaded_files = st.file_uploader("Upload CSVs (multi-file supported)", type=["csv", "txt"], accept_multiple_files=True)
+    status_slot = st.empty()
+    if st.session_state.get("data_loaded") and st.session_state.get("trust_summary"):
+        summary = st.session_state["trust_summary"]
+        status_slot.markdown(
+            f"**Loaded ✅**  \n"
+            f"Files: {summary.get('file_count', 0)} • "
+            f"Date range: {summary.get('date_range_label', '—')} • "
+            f"Rows parsed: {summary.get('raw_rows', 0):,}"
+        )
+    return {"uploaded_files": uploaded_files, "include_stocks": include_stocks, "status_slot": status_slot}
+
+def render_trust_badge(trust_summary: Dict[str, Any]) -> None:
+    status = trust_summary.get("status", st.session_state.get("trust_status", "OK"))
+    unmatched_legs = int(trust_summary.get("unmatched_legs", 0))
+    open_qty_leftover = int(trust_summary.get("open_qty_leftover", 0))
+    status_map = {
+        "OK": ("OK ✅", "status-clean", "Data reconciled; results reliable."),
+        "NEEDS_HISTORY": (
+            "Needs history ⚠️",
+            "status-warn",
+            (
+                "Missing history detected: "
+                f"{unmatched_legs} unmatched legs, {open_qty_leftover} open qty leftover. "
+                "Realized P&L for matched closes is valid."
+            ),
+        ),
+        "ERROR": ("Error ⛔", "status-warn", "Parsing error. Fix column mapping."),
+    }
+    status_label, status_class, message = status_map.get(status, status_map["OK"])
+
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        st.markdown(
+            f"<div class='status-card'>"
+            f"<div class='status-label'>Trust status</div>"
+            f"<div class='status-value {status_class}'>{status_label}</div>"
+            f"<div class='stat-sub'>{message}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        if st.button("View details", key=f"trust-details-{st.session_state.get('nav_tab', 'overview')}"):
+            st.session_state["jump_to"] = "diagnostics_recon"
+            set_nav_tab("Diagnostics")
+
+def render_overview(data: Dict[str, Any]) -> None:
+    st.markdown("### Overview")
+    render_trust_badge(data["trust_summary"])
+
+    trades_sheet = data["closed_trades_df"]
+    if trades_sheet.empty:
+        st.info("No closed trades to display yet.")
+        return
+
+    pnl_total = float(trades_sheet["net_pnl"].sum())
+    winrate = float((trades_sheet["net_pnl"] > 0).mean())
+    wins = trades_sheet[trades_sheet["net_pnl"] > 0]["net_pnl"]
+    losses = trades_sheet[trades_sheet["net_pnl"] < 0]["net_pnl"]
+    profit_factor = wins.sum() / abs(losses.sum()) if not losses.empty else np.inf
+
+    curve = trades_sheet.sort_values("close_date")[["close_date", "net_pnl"]].copy()
+    curve["cum_net"] = curve["net_pnl"].cumsum()
+    curve["peak"] = curve["cum_net"].cummax()
+    curve["drawdown"] = curve["cum_net"] - curve["peak"]
+    max_dd = float(curve["drawdown"].min()) if not curve.empty else 0.0
+    avg_win = float(wins.mean()) if not wins.empty else 0.0
+    avg_loss = float(losses.mean()) if not losses.empty else 0.0
+
+    render_stat_cards(
+        [
+            {"label": "Realized P&L", "value": format_currency(pnl_total), "sub": "Closed trades only"},
+            {"label": "Win rate", "value": format_percent(winrate * 100), "sub": "Realized only"},
+            {"label": "Profit factor", "value": "∞" if np.isinf(profit_factor) else f"{profit_factor:,.2f}", "sub": "Realized only"},
+            {"label": "Max drawdown", "value": format_currency(abs(max_dd)), "sub": "Realized equity curve"},
+            {"label": "# Trades", "value": f"{len(trades_sheet):,}", "sub": "Closed matches"},
+            {
+                "label": "Avg win / Avg loss",
+                "value": f"{format_currency(avg_win)} / {format_currency(avg_loss)}",
+                "sub": "Realized only",
+            },
+        ]
+    )
+
+    st.markdown("#### Top 3 leaks costing you money")
+    summary_by_type = data["leaks_df"]
+    if summary_by_type.empty:
+        st.info("No rule-based leaks detected yet.")
+    else:
+        top_leaks = summary_by_type.head(3).to_dict("records")
+        for leak in top_leaks:
+            rule_text = LEAK_RULES.get(leak["mistake_type"], "Follow your risk rules.")
+            st.markdown(
+                f"**{leak['mistake_type']}**  \n"
+                f"Damage: {format_currency(leak['total_damage'])} • Count: {int(leak['count'])}  \n"
+                f"_Rule_: {rule_text}",
+            )
+            st.button(
+                "Show examples",
+                key=f"leak-{leak['mistake_type']}",
+                on_click=navigate_to_diagnostics,
+                args=(leak["mistake_type"],),
+            )
+
+    st.markdown("#### Equity curve + drawdown (realized)")
+    st.line_chart(curve.set_index("close_date")[["cum_net", "drawdown"]])
+
+    st.markdown("#### Top tickers")
+    by_ticker = (trades_sheet.groupby("underlying", as_index=False)
+                 .agg(net_pnl=("net_pnl", "sum"))
+                 .sort_values("net_pnl", ascending=False))
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Top 5 winners**")
+        st.dataframe(by_ticker.head(5), use_container_width=True)
+    with c2:
+        st.markdown("**Top 5 losers**")
+        st.dataframe(by_ticker.tail(5).sort_values("net_pnl"), use_container_width=True)
+
+    st.markdown("#### Next steps")
+    cta1, cta2 = st.columns(2)
+    with cta1:
+        st.button("Open Calendar", on_click=set_nav_tab, args=("Calendar",))
+    with cta2:
+        st.button("Open Rules Coach", on_click=set_nav_tab, args=("Rules Coach",))
+
+    if st.session_state["user"]:
+        summary_payload = {
+            "realized_pnl": pnl_total,
+            "win_rate": winrate,
+            "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else None,
+            "max_drawdown": abs(max_dd),
+            "trade_count": len(trades_sheet),
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+            "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+        }
+        if st.button("Save run"):
+            save_run_summary(st.session_state["user"]["id"], summary_payload)
+            st.success("Run saved to your account.")
+    else:
+        st.info("Sign in to save runs and view history.")
+
+def render_rules_coach(data: Dict[str, Any]) -> None:
+    st.markdown("### Rules Coach")
+    render_trust_badge(data["trust_summary"])
+    render_rules_coach_overview(data["closed_trades_df"], data["fills_df"])
+
+def render_calendar(data: Dict[str, Any]) -> None:
+    st.markdown("### Calendar")
+    render_trust_badge(data["trust_summary"])
+
+    daily_pnl = data["daily_pnl_df"]
+    if daily_pnl.empty:
+        st.info("No closed trades available to build the daily calendar.")
+        return
+
+    daily_pnl = daily_pnl.copy()
+    daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
+    month_options = sorted(daily_pnl["month"].unique().tolist())
+    default_month = st.session_state.get("selected_month")
+    default_index = month_options.index(default_month) if default_month in month_options else len(month_options) - 1
+    month_sel = st.selectbox("Month", options=month_options, index=default_index, key="calendar-month")
+    st.session_state["selected_month"] = month_sel
+
+    selected_day = render_pnl_calendar(daily_pnl, month_sel)
+    st.session_state["calendar_selected_day"] = selected_day
+
+    if st.button("Clear day filter"):
+        st.session_state["calendar_selected_day"] = None
+        selected_day = None
+
+    if selected_day:
+        st.markdown(f"#### Trades closed on {selected_day:%Y-%m-%d}")
+        filtered = apply_day_filter(data["closed_trades_df"], selected_day)
+        if filtered.empty:
+            st.info("No trades closed on this day.")
+        else:
+            st.dataframe(filtered.sort_values("close_date", ascending=False), use_container_width=True)
+
+    with st.expander("All closed trades", expanded=False):
+        trades = data["closed_trades_df"]
+        if trades.empty:
+            st.info("No closed trades to display.")
+        else:
+            trades = trades.copy()
+            trades["position_type"] = np.where(trades["sell_date"] < trades["buy_date"], "SHORT", "LONG")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                under_options = sorted(trades["underlying"].unique().tolist())
+                under_sel = st.multiselect(
+                    "Underlying",
+                    options=under_options,
+                    default=st.session_state["filters"].get("underlying", under_options) or under_options,
+                )
+            with c2:
+                right_options = sorted(trades["right"].unique().tolist())
+                right_sel = st.multiselect(
+                    "Type (C/P/Stock)",
+                    options=right_options,
+                    default=st.session_state["filters"].get("right", right_options) or right_options,
+                )
+            with c3:
+                pos_options = sorted(trades["position_type"].unique().tolist())
+                pos_sel = st.multiselect(
+                    "Position (SHORT/LONG)",
+                    options=pos_options,
+                    default=st.session_state["filters"].get("position_type", pos_options) or pos_options,
+                )
+
+            st.session_state["filters"] = {
+                "underlying": under_sel,
+                "right": right_sel,
+                "position_type": pos_sel,
+                "date_range": st.session_state["filters"].get("date_range", (None, None)),
+            }
+
+            filtered = trades[
+                trades["underlying"].isin(under_sel)
+                & trades["right"].isin(right_sel)
+                & trades["position_type"].isin(pos_sel)
+            ].copy()
+            if filtered.empty:
+                st.warning("No trades match your filters.")
+            else:
+                st.dataframe(
+                    filtered.sort_values("close_date", ascending=False).head(200),
+                    use_container_width=True,
+                )
+                st.caption("Showing top 200 rows. Download full data from Export.")
+
+def render_diagnostics(data: Dict[str, Any]) -> None:
+    st.markdown("### Reconciliation & Data Quality")
+    st.markdown("<div id='diagnostics_recon'></div>", unsafe_allow_html=True)
+    if st.session_state.get("jump_to") == "diagnostics_recon":
+        st.session_state["jump_to"] = None
+
+    recon = data["recon_summary"]
+    date_range_label = data["date_range_label"]
+    status_class = "status-clean" if not data["has_issues"] else "status-warn"
+    render_status_cards(
+        [
+            {
+                "label": "Rows parsed",
+                "value": f"{recon['raw_rows']:,}",
+                "status_class": status_class,
+                "sub": "All rows loaded from the selected CSVs.",
+            },
+            {
+                "label": "Files uploaded",
+                "value": f"{recon['file_count']:,}",
+                "status_class": status_class,
+                "sub": "Unique CSV sources included in this run.",
+            },
+            {
+                "label": "Date range",
+                "value": date_range_label,
+                "status_class": status_class,
+                "sub": "Coverage window of your uploaded history.",
+            },
+            {
+                "label": "Duplicates removed",
+                "value": f"{recon['duplicate_count']:,}",
+                "status_class": status_class,
+                "sub": (
+                    "Overlapping CSV ranges detected; duplicates removed using key: "
+                    "trade_dt|side|qty|price|fees|multiplier|asset_type|underlying|expiry|strike|right."
+                ),
+            },
+            {
+                "label": "Unmatched legs",
+                "value": f"{recon['unmatched_legs']:,}",
+                "status_class": status_class,
+                "sub": (
+                    "Options legs present without a matching open/close in this dataset. "
+                    "Usually caused by missing date ranges. Upload older CSVs until this drops."
+                ),
+            },
+            {
+                "label": "Open qty leftover",
+                "value": f"{recon['open_qty']:,}",
+                "status_class": status_class,
+                "sub": (
+                    "Positions still open at end of dataset OR missing closes. Realized P&L for "
+                    "matched closes is still valid; open/unrealized may be impacted."
+                ),
+            },
+            {
+                "label": "Fees included",
+                "value": f"{'Yes' if recon['fees_included'] else 'No'}",
+                "status_class": "status-clean" if recon["fees_included"] else "status-warn",
+                "sub": f"Fees included from columns: {', '.join(recon['fee_columns']) or '—'}.",
+            },
+            {
+                "label": "Roll detection",
+                "value": recon["roll_confidence"],
+                "status_class": status_class,
+                "sub": "Heuristic only. Review suggested if open qty leftover or unmatched legs are nonzero.",
+            },
+        ]
+    )
+
+    if data["has_issues"]:
+        st.warning(f"{data['status_icon']} Issues detected — review before trusting results.")
+
+    issue_df = data["issues_samples_df"]
+    summary_table = data["issues_summary_df"]
+    with st.expander("View issues", expanded=data["has_issues"]):
+        if summary_table.empty:
+            st.success("No reconciliation issues detected.")
+        else:
+            st.markdown("**Issue summary**")
+            st.dataframe(summary_table[["issue_type", "count", "severity"]], use_container_width=True)
+            issue_types = summary_table["issue_type"].tolist()
+            selected_issue = st.selectbox("Issue type", options=issue_types)
+            sample_rows = issue_df[issue_df["issue_type"] == selected_issue].head(25)
+            st.markdown("**Sample rows (max 25)**")
+            st.dataframe(sample_rows, use_container_width=True)
+
+        show_fix = st.button("Fix suggestions")
+        with st.expander("How to fix these issues", expanded=show_fix):
+            if recon["unmatched_legs"] > 0 or recon["open_qty"] > 0:
+                openpos = data["open_positions_df"]
+                affected_dates = pd.to_datetime(openpos["date"], errors="coerce")
+                earliest_date = affected_dates.min() if not affected_dates.empty else pd.NaT
+                if pd.isna(earliest_date):
+                    st.write("No issues detected ✅")
+                else:
+                    st.markdown(f"**Earliest missing date:** {earliest_date.date().isoformat()}")
+                    st.markdown("**Suggested Fidelity export windows (90-day chunks):**")
+                    start = earliest_date.date()
+                    end = date.today()
+                    windows = []
+                    while start <= end:
+                        window_end = min(start + timedelta(days=89), end)
+                        windows.append(f"{start.isoformat()} → {window_end.isoformat()}")
+                        start = window_end + timedelta(days=1)
+                    for window in windows[:4]:
+                        st.markdown(f"- {window}")
+                    if len(windows) > 4:
+                        st.markdown(f"- ... ({len(windows)} total windows)")
+                    top_under = (openpos["underlying"].value_counts().head(5).index.tolist()
+                                 if not openpos.empty else [])
+                    if top_under:
+                        st.markdown("**Top underlyings affected:** " + ", ".join(top_under))
+            else:
+                st.write("No issues detected ✅")
+
+    with st.expander(
+        "Upload details & column mapping",
+        expanded=st.session_state.get("trust_status") == "ERROR",
+    ):
+        for entry in data["file_entries"]:
+            st.markdown(f"**{entry['file'].name}**")
+            cols = list(entry["df"].columns)
+            choice = st.selectbox(
+                "Broker format",
+                ["Auto", "Fidelity", "IBKR"],
+                index=0,
+                key=f"broker-{entry['index']}",
+            )
+            broker = entry["detected"] if choice == "Auto" else choice
+            st.caption(f"Detected: {entry['detected']} | Using: {broker}")
+            if broker == "IBKR":
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.selectbox(
+                        "Trade datetime",
+                        cols,
+                        index=cols.index(pick_like(cols, ["Date/Time", "Date", "TradeDate", "Timestamp"])),
+                        key=f"dt-{entry['index']}",
+                    )
+                    st.selectbox(
+                        "Symbol/Description",
+                        cols,
+                        index=cols.index(pick_like(cols, ["Symbol", "Description", "Instrument"])),
+                        key=f"sym-{entry['index']}",
+                    )
+                    st.selectbox(
+                        "Side",
+                        cols,
+                        index=cols.index(pick_like(cols, ["Side", "Action", "Buy/Sell", "B/S"])),
+                        key=f"side-{entry['index']}",
+                    )
+                    st.selectbox(
+                        "Quantity",
+                        cols,
+                        index=cols.index(pick_like(cols, ["Quantity", "Qty", "Size"])),
+                        key=f"qty-{entry['index']}",
+                    )
+                with c2:
+                    st.selectbox(
+                        "Price",
+                        cols,
+                        index=cols.index(pick_like(cols, ["Price", "TradePrice", "FillPrice"])),
+                        key=f"price-{entry['index']}",
+                    )
+                    st.selectbox(
+                        "Fees/Commission",
+                        ["(none)"] + cols,
+                        index=0,
+                        key=f"fees-{entry['index']}",
+                    )
+                    st.selectbox(
+                        "Multiplier",
+                        ["(none)"] + cols,
+                        index=0,
+                        key=f"mult-{entry['index']}",
+                    )
+            elif broker == "Fidelity":
+                st.caption("Fidelity format auto-detected. No mapping required.")
+            else:
+                st.warning("Unable to detect broker format. Select Fidelity or IBKR.")
+
+    if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
+        st.warning("Diagnostics are part of the paid plan. Upgrade to unlock.")
+        return
+
+    st.markdown("### Issues & leak diagnostics")
+    mistakes_df = data["mistake_output"]["mistakes_df"]
+    summary_by_type = data["mistake_output"]["summary_by_type"]
+    summary_by_week = data["mistake_output"]["summary_by_week"]
+    examples_by_type = data["mistake_output"]["examples_by_type"]
+    held_tables = data["mistake_output"]["held_tables"]
+
+    if data["closed_trades_df"].empty:
+        st.info("No closed trades to analyze for mistakes.")
+    elif mistakes_df.empty:
+        st.info("No mistakes detected with current rules.")
+    else:
+        st.dataframe(summary_by_type, use_container_width=True)
+        if not summary_by_week.empty:
+            top_types = summary_by_type.head(3)["mistake_type"].tolist()
+            weekly = summary_by_week[summary_by_week["mistake_type"].isin(top_types)]
+            weekly_pivot = weekly.pivot(index="week_key", columns="mistake_type", values="total_damage").fillna(0)
+            st.line_chart(weekly_pivot)
+
+        type_options = summary_by_type["mistake_type"].tolist()
+        default_type = st.session_state.get("diagnostics_mistake_type")
+        default_index = type_options.index(default_type) if default_type in type_options else 0
+        type_sel = st.selectbox("Mistake type", type_options, index=default_index)
+        examples = examples_by_type[examples_by_type["mistake_type"] == type_sel].head(20).copy()
+        examples["date"] = examples["close_date"].dt.date
+        st.dataframe(examples[["date", "underlying", "contract_key", "net_pnl", "severity", "details"]], use_container_width=True)
+
+        if not examples.empty:
+            ex_idx = st.selectbox(
+                "Inspect example row",
+                examples.index.tolist(),
+                format_func=lambda i: f"{examples.loc[i, 'date']} | {examples.loc[i, 'details']}",
+            )
+            selected = examples.loc[ex_idx]
+            trades_view = data["closed_trades_df"].copy()
+            trades_view["close_date"] = trades_view[["buy_date", "sell_date"]].max(axis=1)
+            trades_view["contract_key"] = _contract_key(trades_view)
+
+            if type_sel == "Overtrading day":
+                trades_view = trades_view[trades_view["close_date"].dt.date == selected["date"]]
+            elif type_sel == "Gave back gains in ticker":
+                trades_view = trades_view[trades_view["underlying"] == selected["underlying"]]
+            elif type_sel == "Big loss outlier":
+                trades_view = trades_view[trades_view["trade_id"] == selected["trade_id"]]
+            elif type_sel == "Averaged down (added to loser)":
+                trades_view = trades_view[trades_view["contract_key"] == selected["contract_key"]]
+            st.markdown("#### Related closed trades")
+            st.dataframe(trades_view.sort_values("close_date"), use_container_width=True)
+
+        if "losers" in held_tables and "winners" in held_tables:
+            st.markdown("### Holding time contrast")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.dataframe(held_tables["losers"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
+            with c2:
+                st.dataframe(held_tables["winners"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
+
+    if not data["open_positions_df"].empty:
+        st.markdown("### Options & Open Positions")
+        if data["mark_data_available"]:
+            st.success("Mark data available — unrealized P&L shown separately.")
+        else:
+            st.warning("Unrealized P&L not available yet (no mark data).")
+        st.dataframe(data["open_positions_df"].sort_values(["underlying", "expiry", "strike", "right", "side", "date"]), use_container_width=True)
+    else:
+        st.markdown("### Options & Open Positions")
+        st.info("No open positions detected.")
+
+def render_export(data: Dict[str, Any]) -> None:
+    st.markdown("### Export")
+    st.caption("Download normalized data and analysis outputs.")
+
+    def csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        "Download normalized fills",
+        data=csv_bytes(data["fills_df"]),
+        file_name="normalized_fills.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download closed trades",
+        data=csv_bytes(data["closed_trades_df"]),
+        file_name="closed_trades.csv",
+        mime="text/csv",
+        disabled=data["closed_trades_df"].empty,
+    )
+    st.download_button(
+        "Download daily P&L",
+        data=csv_bytes(data["daily_pnl_df"]),
+        file_name="daily_pnl.csv",
+        mime="text/csv",
+        disabled=data["daily_pnl_df"].empty,
+    )
+    if data["sim_outputs"]["overrides_df"] is not None:
+        st.download_button(
+            "Download affected trades (rules overrides)",
+            data=csv_bytes(data["sim_outputs"]["overrides_df"]),
+            file_name="rules_overrides.csv",
+            mime="text/csv",
+            disabled=data["sim_outputs"]["overrides_df"].empty,
+        )
+
+    if data["daily_pnl_df"].empty:
+        st.info("Need closed trades to generate a shareable month summary.")
+    else:
+        st.markdown("### Share my month (PNG)")
+        daily_pnl = data["daily_pnl_df"].copy()
+        daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
+        month_options = sorted(daily_pnl["month"].unique().tolist())
+        month_sel = st.selectbox("Month to share", month_options, index=len(month_options) - 1, key="share-month")
+        summary_by_type = data["mistake_output"]["summary_by_type"]
+        top_leaks = summary_by_type.head(3).to_dict("records") if not summary_by_type.empty else []
+        by_ticker = (data["closed_trades_df"].groupby("underlying", as_index=False)
+                     .agg(net_pnl=("net_pnl", "sum"))
+                     .sort_values("net_pnl", ascending=False))
+        summary_payload = {
+            "realized_pnl": float(data["closed_trades_df"]["net_pnl"].sum()) if not data["closed_trades_df"].empty else 0.0,
+            "max_drawdown": abs(float(data["closed_trades_df"].sort_values("close_date")["net_pnl"].cumsum().sub(
+                data["closed_trades_df"].sort_values("close_date")["net_pnl"].cumsum().cummax()).min()))
+            if not data["closed_trades_df"].empty else 0.0,
+            "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+            "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+        }
+        png_bytes = build_share_image(daily_pnl[daily_pnl["month"] == month_sel], month_sel, summary_payload, top_leaks)
+        st.download_button(
+            "Download shareable PNG",
+            data=png_bytes,
+            file_name=f"trade-summary-{month_sel}.png",
+            mime="image/png",
+        )
+
+def render_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    st.markdown("### Settings")
+    updated = dict(settings)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        updated["account_size"] = st.number_input(
+            "Account size ($)",
+            min_value=0.0,
+            value=float(updated.get("account_size", 100000.0)),
+            step=1000.0,
+        )
+    with c2:
+        updated["max_loss_pct"] = st.number_input(
+            "Max loss % per trade",
+            min_value=0.0,
+            value=float(updated.get("max_loss_pct", 1.0)),
+            step=0.1,
+        )
+    with c3:
+        updated["red_day_pct"] = st.number_input(
+            "Red day stop %",
+            min_value=0.0,
+            value=float(updated.get("red_day_pct", 2.0)),
+            step=0.1,
+        )
+
+    toggles = updated.get("toggles", {})
+    t1, t2 = st.columns(2)
+    with t1:
+        toggles["realized_only"] = st.checkbox("Realized only", value=bool(toggles.get("realized_only", True)))
+    with t2:
+        toggles["include_stocks"] = st.checkbox(
+            "Include stocks",
+            value=bool(toggles.get("include_stocks", False)),
+        )
+    updated["toggles"] = toggles
+
+    st.markdown("#### Current settings summary")
+    st.json(updated)
+    return updated
 def format_currency(value: float) -> str:
     return f"${value:,.2f}"
 
@@ -314,6 +925,25 @@ if "user" not in st.session_state:
     st.session_state["user"] = None
 if "nav_tab" not in st.session_state:
     st.session_state["nav_tab"] = "Overview"
+st.session_state.setdefault("data_loaded", False)
+st.session_state.setdefault("trust_status", "OK")
+st.session_state.setdefault("trust_summary", {})
+st.session_state.setdefault("selected_month", datetime.today().strftime("%Y-%m"))
+st.session_state.setdefault("calendar_selected_day", None)
+st.session_state.setdefault("rules_selected_rule", None)
+st.session_state.setdefault(
+    "filters",
+    {"underlying": [], "right": [], "position_type": [], "date_range": (None, None)},
+)
+st.session_state.setdefault(
+    "settings",
+    {
+        "account_size": 100000.0,
+        "max_loss_pct": 1.0,
+        "red_day_pct": 2.0,
+        "toggles": {"realized_only": True, "include_stocks": False},
+    },
+)
 
 
 
@@ -1248,6 +1878,7 @@ def render_rules_coach_overview(
             if st.button("View affected trades", key=f"view-affected-{key}"):
                 st.session_state["rules_coach_selected_rules"] = [summary.get("name", key)]
                 st.session_state["rules_coach_show_affected"] = True
+                st.session_state["rules_selected_rule"] = summary.get("name", key)
 
     rule_order = [
         rule_summaries.get("rule1", {}).get("name", "Rule 1 — No Averaging Down"),
@@ -1290,6 +1921,7 @@ def render_rules_coach_overview(
                 options=rule_options,
                 default=default_rules,
             )
+        st.session_state["rules_selected_rule"] = selected_rules[0] if len(selected_rules) == 1 else None
         with c2:
             underlying_options = sorted(sim_trades["underlying"].dropna().unique().tolist())
             selected_underlyings = st.multiselect(
@@ -1304,6 +1936,13 @@ def render_rules_coach_overview(
             date_range = st.date_input("Close date range", (min_date, max_date))
         with c4:
             only_changed = st.checkbox("Only changed trades", value=True)
+
+        st.session_state["filters"] = {
+            "underlying": selected_underlyings,
+            "right": st.session_state["filters"].get("right", []),
+            "position_type": st.session_state["filters"].get("position_type", []),
+            "date_range": date_range if isinstance(date_range, tuple) else (min_date, max_date),
+        }
 
         filtered = sim_trades.copy()
         if selected_rules:
@@ -1436,9 +2075,7 @@ def apply_day_filter(closed_trades: pd.DataFrame, selected_day: Optional[date]) 
 def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optional[date]:
     if daily_pnl_df.empty:
         st.info("No daily P&L data available for the calendar.")
-        return st.session_state.get("selected_day")
-
-    st.session_state.setdefault("selected_day", None)
+        return st.session_state.get("calendar_selected_day")
 
     year, month = (int(part) for part in month_yyyy_mm.split("-"))
     month_df = daily_pnl_df.copy()
@@ -1542,7 +2179,7 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
     selected_day_param = query_params.get("selected_day", [None])[0]
     if selected_day_param:
         try:
-            st.session_state["selected_day"] = date.fromisoformat(selected_day_param)
+            st.session_state["calendar_selected_day"] = date.fromisoformat(selected_day_param)
         except ValueError:
             pass
 
@@ -1585,7 +2222,7 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
                 """
                 st.markdown(card_html, unsafe_allow_html=True)
 
-    return st.session_state.get("selected_day")
+    return st.session_state.get("calendar_selected_day")
 
 # -------------------------
 # Broker detection + normalization
@@ -1799,6 +2436,17 @@ def compute_reconciliation_metrics(
         "roll_confidence": roll_confidence,
     }
 
+def pick_like(cols: List[str], candidates: List[str]) -> str:
+    for cand in candidates:
+        for c in cols:
+            if cand.lower() == str(c).lower():
+                return c
+    for cand in candidates:
+        for c in cols:
+            if cand.lower() in str(c).lower():
+                return c
+    return cols[0] if cols else ""
+
 def build_share_image(
     daily_pnl: pd.DataFrame,
     month_str: str,
@@ -1871,16 +2519,10 @@ def build_share_image(
 # -------------------------
 # UI
 # -------------------------
-st.title("Trade Analyzer Pro")
-st.caption("Upload Fidelity or IBKR fills. The app reconciles, dedupes, and separates realized vs unrealized results.")
+header_controls = render_header_controls()
+uploaded_files = header_controls["uploaded_files"]
+include_stocks = header_controls["include_stocks"]
 
-include_stocks = st.toggle(
-    "Include stock trades in P&L calculations",
-    value=False,
-    help="When enabled, equity trades are included alongside options.",
-)
-
-uploaded_files = st.file_uploader("Upload CSVs (multi-file supported)", type=["csv", "txt"], accept_multiple_files=True)
 if not uploaded_files:
     st.stop()
 
@@ -1901,106 +2543,65 @@ for idx, up in enumerate(uploaded_files):
     file_entries.append({"file": up, "df": df, "detected": detected, "broker": detected, "index": idx})
 
 if file_errors:
+    st.session_state["trust_status"] = "ERROR"
+    st.session_state["trust_summary"] = {
+        "status": "ERROR",
+        "file_count": len(uploaded_files),
+        "raw_rows": raw_rows,
+        "date_range_label": "—",
+        "unmatched_legs": 0,
+        "open_qty_leftover": 0,
+    }
     st.error("Some files could not be parsed:\n" + "\n".join(file_errors))
     log_event("error", details={"errors": file_errors}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
     st.stop()
 
-def pick_like(cols: List[str], candidates: List[str]) -> str:
-    for cand in candidates:
-        for c in cols:
-            if cand.lower() == str(c).lower():
-                return c
-    for cand in candidates:
-        for c in cols:
-            if cand.lower() in str(c).lower():
-                return c
-    return cols[0] if cols else ""
+def _ensure_state_value(key: str, default: Any) -> Any:
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.session_state[key]
 
-with st.expander("Upload details & column mapping", expanded=False):
-    for entry in file_entries:
-        st.markdown(f"**{entry['file'].name}**")
-        cols = list(entry["df"].columns)
-        choice = st.selectbox(
-            "Broker format",
-            ["Auto", "Fidelity", "IBKR"],
-            index=0,
-            key=f"broker-{entry['index']}",
-        )
-        broker = entry["detected"] if choice == "Auto" else choice
-        entry["broker"] = broker
-        st.caption(f"Detected: {entry['detected']} | Using: {broker}")
-        if broker == "IBKR":
-            c1, c2 = st.columns(2)
-            with c1:
-                col_datetime = st.selectbox(
-                    "Trade datetime",
-                    cols,
-                    index=cols.index(pick_like(cols, ["Date/Time", "Date", "TradeDate", "Timestamp"])),
-                    key=f"dt-{entry['index']}",
-                )
-                col_symbol = st.selectbox(
-                    "Symbol/Description",
-                    cols,
-                    index=cols.index(pick_like(cols, ["Symbol", "Description", "Instrument"])),
-                    key=f"sym-{entry['index']}",
-                )
-                col_side = st.selectbox(
-                    "Side",
-                    cols,
-                    index=cols.index(pick_like(cols, ["Side", "Action", "Buy/Sell", "B/S"])),
-                    key=f"side-{entry['index']}",
-                )
-                col_qty = st.selectbox(
-                    "Quantity",
-                    cols,
-                    index=cols.index(pick_like(cols, ["Quantity", "Qty", "Size"])),
-                    key=f"qty-{entry['index']}",
-                )
-            with c2:
-                col_price = st.selectbox(
-                    "Price",
-                    cols,
-                    index=cols.index(pick_like(cols, ["Price", "TradePrice", "FillPrice"])),
-                    key=f"price-{entry['index']}",
-                )
-                col_fees = st.selectbox(
-                    "Fees/Commission",
-                    ["(none)"] + cols,
-                    index=0,
-                    key=f"fees-{entry['index']}",
-                )
-                col_mult = st.selectbox(
-                    "Multiplier",
-                    ["(none)"] + cols,
-                    index=0,
-                    key=f"mult-{entry['index']}",
-                )
-            entry["mapping"] = {
-                "datetime": col_datetime,
-                "symbol": col_symbol,
-                "side": col_side,
-                "qty": col_qty,
-                "price": col_price,
-                "fees": None if col_fees == "(none)" else col_fees,
-                "multiplier": None if col_mult == "(none)" else col_mult,
-            }
-        elif broker == "Fidelity":
-            entry["mapping"] = None
-        else:
-            st.warning("Unable to detect broker format. Select Fidelity or IBKR.")
+def _ensure_column_value(cols: List[str], key: str, default: str) -> str:
+    value = _ensure_state_value(key, default)
+    if value not in cols:
+        value = default
+        st.session_state[key] = value
+    return value
 
 normalized_frames = []
 for entry in file_entries:
-    broker = entry["broker"]
-    df = entry["df"]
+    cols = list(entry["df"].columns)
+    broker_choice = _ensure_state_value(f"broker-{entry['index']}", "Auto")
+    broker = entry["detected"] if broker_choice == "Auto" else broker_choice
+    entry["broker"] = broker
+
+    mapping = None
+    if broker == "IBKR":
+        dt_col = _ensure_column_value(cols, f"dt-{entry['index']}", pick_like(cols, ["Date/Time", "Date", "TradeDate", "Timestamp"]))
+        sym_col = _ensure_column_value(cols, f"sym-{entry['index']}", pick_like(cols, ["Symbol", "Description", "Instrument"]))
+        side_col = _ensure_column_value(cols, f"side-{entry['index']}", pick_like(cols, ["Side", "Action", "Buy/Sell", "B/S"]))
+        qty_col = _ensure_column_value(cols, f"qty-{entry['index']}", pick_like(cols, ["Quantity", "Qty", "Size"]))
+        price_col = _ensure_column_value(cols, f"price-{entry['index']}", pick_like(cols, ["Price", "TradePrice", "FillPrice"]))
+        fees_val = _ensure_state_value(f"fees-{entry['index']}", "(none)")
+        mult_val = _ensure_state_value(f"mult-{entry['index']}", "(none)")
+        mapping = {
+            "datetime": dt_col,
+            "symbol": sym_col,
+            "side": side_col,
+            "qty": qty_col,
+            "price": price_col,
+            "fees": None if fees_val == "(none)" else fees_val,
+            "multiplier": None if mult_val == "(none)" else mult_val,
+        }
+    entry["mapping"] = mapping
+
     if broker == "Fidelity":
-        normalized = normalize_fidelity(df, include_stocks)
-        fee_columns.extend([col for col in ["Commission", "Fees"] if col in df.columns])
+        normalized = normalize_fidelity(entry["df"], include_stocks)
+        fee_columns.extend([col for col in ["Commission", "Fees"] if col in entry["df"].columns])
     elif broker == "IBKR":
-        mapping = entry.get("mapping")
         if mapping is None:
             continue
-        normalized = normalize_ibkr(df, mapping, include_stocks)
+        normalized = normalize_ibkr(entry["df"], mapping, include_stocks)
         if mapping.get("fees"):
             fee_columns.append(mapping["fees"])
     else:
@@ -2009,6 +2610,7 @@ for entry in file_entries:
     normalized_frames.append(normalized)
 
 if not normalized_frames:
+    st.session_state["trust_status"] = "ERROR"
     st.warning("No trades parsed from these files.")
     st.stop()
 
@@ -2096,74 +2698,26 @@ if not openpos.empty:
         })
 
 has_issues = duplicate_count > 0 or recon["unmatched_legs"] > 0 or recon["open_qty"] > 0
-status_icon = "✅" if not has_issues else "⚠️"
-status_class = "status-clean" if not has_issues else "status-warn"
-
-st.markdown("### Reconciliation & Data Quality")
-render_status_cards(
-    [
-        {
-            "label": "Rows parsed",
-            "value": f"{recon['raw_rows']:,}",
-            "status_class": status_class,
-            "sub": "All rows loaded from the selected CSVs.",
-        },
-        {
-            "label": "Files uploaded",
-            "value": f"{recon['file_count']:,}",
-            "status_class": status_class,
-            "sub": "Unique CSV sources included in this run.",
-        },
-        {
-            "label": "Date range",
-            "value": date_range_label,
-            "status_class": status_class,
-            "sub": "Coverage window of your uploaded history.",
-        },
-        {
-            "label": "Duplicates removed",
-            "value": f"{recon['duplicate_count']:,}",
-            "status_class": status_class,
-            "sub": (
-                "Overlapping CSV ranges detected; duplicates removed using key: "
-                "trade_dt|side|qty|price|fees|multiplier|asset_type|underlying|expiry|strike|right."
-            ),
-        },
-        {
-            "label": "Unmatched legs",
-            "value": f"{recon['unmatched_legs']:,}",
-            "status_class": status_class,
-            "sub": (
-                "Options legs present without a matching open/close in this dataset. "
-                "Usually caused by missing date ranges. Upload older CSVs until this drops."
-            ),
-        },
-        {
-            "label": "Open qty leftover",
-            "value": f"{recon['open_qty']:,}",
-            "status_class": status_class,
-            "sub": (
-                "Positions still open at end of dataset OR missing closes. Realized P&L for "
-                "matched closes is still valid; open/unrealized may be impacted."
-            ),
-        },
-        {
-            "label": "Fees included",
-            "value": f"{'Yes' if recon['fees_included'] else 'No'}",
-            "status_class": "status-clean" if recon["fees_included"] else "status-warn",
-            "sub": f"Fees included from columns: {', '.join(recon['fee_columns']) or '—'}.",
-        },
-        {
-            "label": "Roll detection",
-            "value": recon["roll_confidence"],
-            "status_class": status_class,
-            "sub": "Heuristic only. Review suggested if open qty leftover or unmatched legs are nonzero.",
-        },
-    ]
+parse_error = any(entry["broker"] == "Unknown" for entry in file_entries)
+needs_history = recon["unmatched_legs"] > 0 or recon["open_qty"] > 0
+trust_status = "ERROR" if parse_error else "NEEDS_HISTORY" if needs_history else "OK"
+st.session_state["trust_status"] = trust_status
+trust_summary = {
+    "status": trust_status,
+    "file_count": len(uploaded_files),
+    "raw_rows": raw_rows,
+    "date_range_label": date_range_label,
+    "unmatched_legs": recon["unmatched_legs"],
+    "open_qty_leftover": recon["open_qty"],
+}
+st.session_state["trust_summary"] = trust_summary
+st.session_state["data_loaded"] = True
+header_controls["status_slot"].markdown(
+    f"**Loaded ✅**  \n"
+    f"Files: {trust_summary['file_count']} • "
+    f"Date range: {trust_summary['date_range_label']} • "
+    f"Rows parsed: {trust_summary['raw_rows']:,}"
 )
-
-if has_issues:
-    st.warning(f"{status_icon} Issues detected — review before trusting results.")
 
 issue_df = pd.DataFrame(issues)
 severity_map = {
@@ -2178,60 +2732,6 @@ if not issue_df.empty:
                      .agg(count=("issue_type", "size")))
     summary_table["severity"] = summary_table["issue_type"].map(severity_map).fillna("MED")
     summary_table = summary_table.sort_values(["severity", "count"], ascending=[False, False])
-
-with st.expander("View issues", expanded=has_issues):
-    if summary_table.empty:
-        st.success("No reconciliation issues detected.")
-    else:
-        st.markdown("**Issue summary**")
-        st.dataframe(summary_table[["issue_type", "count", "severity"]], use_container_width=True)
-        issue_types = summary_table["issue_type"].tolist()
-        selected_issue = st.selectbox("Issue type", options=issue_types)
-        sample_rows = issue_df[issue_df["issue_type"] == selected_issue].head(25)
-        st.markdown("**Sample rows (max 25)**")
-        st.dataframe(sample_rows, use_container_width=True)
-
-    show_fix = st.button("Fix suggestions")
-    with st.expander("How to fix these issues", expanded=show_fix):
-        if recon["unmatched_legs"] > 0 or recon["open_qty"] > 0:
-            affected_dates = pd.to_datetime(openpos["date"], errors="coerce")
-            earliest_date = affected_dates.min() if not affected_dates.empty else pd.NaT
-            if pd.isna(earliest_date):
-                st.write("No issues detected ✅")
-            else:
-                st.markdown(f"**Earliest missing date:** {earliest_date.date().isoformat()}")
-                st.markdown("**Suggested Fidelity export windows (90-day chunks):**")
-                start = earliest_date.date()
-                end = date.today()
-                windows = []
-                while start <= end:
-                    window_end = min(start + timedelta(days=89), end)
-                    windows.append(f"{start.isoformat()} → {window_end.isoformat()}")
-                    start = window_end + timedelta(days=1)
-                for window in windows[:4]:
-                    st.markdown(f"- {window}")
-                if len(windows) > 4:
-                    st.markdown(f"- ... ({len(windows)} total windows)")
-                top_under = (openpos["underlying"].value_counts().head(5).index.tolist()
-                             if not openpos.empty else [])
-                if top_under:
-                    st.markdown("**Top underlyings affected:** " + ", ".join(top_under))
-        else:
-            st.write("No issues detected ✅")
-
-nav_tabs = ["Overview", "Journal", "Options", "Diagnostics", "Export", "Settings"]
-nav_index = nav_tabs.index(st.session_state.get("nav_tab", "Overview"))
-nav_selection = st.radio(
-    "Navigation",
-    nav_tabs,
-    index=nav_index,
-    horizontal=True,
-    key="nav_tab",
-    label_visibility="collapsed",
-)
-if st.session_state.get("last_nav") != nav_selection:
-    st.session_state["last_nav"] = nav_selection
-    log_event("page_view", details={"tab": nav_selection}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
 
 mistake_output = {"mistakes_df": pd.DataFrame(), "summary_by_type": pd.DataFrame(), "summary_by_week": pd.DataFrame(),
                   "examples_by_type": pd.DataFrame(), "held_tables": {}}
@@ -2252,338 +2752,73 @@ if not trades_sheet.empty:
 
 mark_data_available = False
 
+equity_curve_df = pd.DataFrame()
+if not trades_sheet.empty:
+    curve = trades_sheet.sort_values("close_date")[["close_date", "net_pnl"]].copy()
+    curve["cum_net"] = curve["net_pnl"].cumsum()
+    curve["peak"] = curve["cum_net"].cummax()
+    curve["drawdown"] = curve["cum_net"] - curve["peak"]
+    equity_curve_df = curve
+
+sim_outputs = {"overrides_df": pd.DataFrame()}
+if not trades_sheet.empty:
+    prepared = _prepare_closed_trades(trades_sheet)
+    defaults = _compute_rule_defaults(prepared)
+    max_loss = float(st.session_state.get("rules_max_loss", defaults["max_loss"]))
+    red_day_limit = float(st.session_state.get("rules_red_day_limit", defaults["red_day_limit"]))
+    _, overrides_df, _, _ = simulate_rules(prepared, work, params={"max_loss": max_loss, "red_day_limit": red_day_limit})
+    sim_outputs["overrides_df"] = overrides_df
+
+nav_tabs = ["Overview", "Rules Coach", "Calendar", "Diagnostics", "Export", "Settings"]
+if st.session_state.get("nav_tab") not in nav_tabs:
+    st.session_state["nav_tab"] = "Overview"
+nav_index = nav_tabs.index(st.session_state.get("nav_tab", "Overview"))
+nav_selection = st.radio(
+    "Navigation",
+    nav_tabs,
+    index=nav_index,
+    horizontal=True,
+    key="nav_tab",
+    label_visibility="collapsed",
+)
+if st.session_state.get("last_nav") != nav_selection:
+    st.session_state["last_nav"] = nav_selection
+    log_event("page_view", details={"tab": nav_selection}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
+
+data = {
+    "fills_df": work,
+    "closed_trades_df": trades_sheet,
+    "daily_pnl_df": daily_pnl,
+    "equity_curve_df": equity_curve_df,
+    "recon_summary": recon,
+    "issues_summary_df": summary_table,
+    "issues_samples_df": issue_df,
+    "leaks_df": mistake_output["summary_by_type"],
+    "sim_outputs": sim_outputs,
+    "trust_summary": trust_summary,
+    "date_range_label": date_range_label,
+    "has_issues": has_issues,
+    "status_icon": "✅" if not has_issues else "⚠️",
+    "open_positions_df": openpos,
+    "mark_data_available": mark_data_available,
+    "file_entries": file_entries,
+    "mistake_output": mistake_output,
+}
+
 if nav_selection == "Overview":
-    st.markdown("### Overview")
-    if trades_sheet.empty:
-        st.info("No closed trades to display yet.")
-    else:
-        if recon["unmatched_legs"] > 0 or recon["open_qty"] > 0:
-            st.warning(
-                "Issues detected. Realized P&L for matched closes is valid; simulations and open-position stats "
-                "may be impacted until you upload missing history."
-            )
-
-        pnl_total = float(trades_sheet["net_pnl"].sum())
-        winrate = float((trades_sheet["net_pnl"] > 0).mean())
-        wins = trades_sheet[trades_sheet["net_pnl"] > 0]["net_pnl"]
-        losses = trades_sheet[trades_sheet["net_pnl"] < 0]["net_pnl"]
-        profit_factor = wins.sum() / abs(losses.sum()) if not losses.empty else np.inf
-
-        curve = trades_sheet.sort_values("close_date")[["close_date", "net_pnl"]].copy()
-        curve["cum_net"] = curve["net_pnl"].cumsum()
-        curve["peak"] = curve["cum_net"].cummax()
-        curve["drawdown"] = curve["cum_net"] - curve["peak"]
-        max_dd = float(curve["drawdown"].min()) if not curve.empty else 0.0
-        avg_win = float(wins.mean()) if not wins.empty else 0.0
-        avg_loss = float(losses.mean()) if not losses.empty else 0.0
-
-        render_stat_cards(
-            [
-                {"label": "Realized P&L", "value": format_currency(pnl_total), "sub": "Closed trades only"},
-                {"label": "Win rate", "value": format_percent(winrate * 100), "sub": "Realized only"},
-                {"label": "Profit factor", "value": "∞" if np.isinf(profit_factor) else f"{profit_factor:,.2f}", "sub": "Realized only"},
-                {"label": "Max drawdown", "value": format_currency(abs(max_dd)), "sub": "Realized equity curve"},
-                {"label": "# Trades", "value": f"{len(trades_sheet):,}", "sub": "Closed matches"},
-                {
-                    "label": "Avg win / Avg loss",
-                    "value": f"{format_currency(avg_win)} / {format_currency(avg_loss)}",
-                    "sub": "Realized only",
-                },
-            ]
-        )
-
-        render_rules_coach_overview(trades_sheet, work)
-
-        st.markdown("#### Top 3 leaks costing you money")
-        summary_by_type = mistake_output["summary_by_type"]
-        if summary_by_type.empty:
-            st.info("No rule-based leaks detected yet.")
-        else:
-            top_leaks = summary_by_type.head(3).to_dict("records")
-            for leak in top_leaks:
-                rule_text = LEAK_RULES.get(leak["mistake_type"], "Follow your risk rules.")
-                st.markdown(
-                    f"**{leak['mistake_type']}**  \n"
-                    f"Damage: {format_currency(leak['total_damage'])} • Count: {int(leak['count'])}  \n"
-                    f"_Rule_: {rule_text}",
-                )
-                st.button(
-                    "Show examples",
-                    key=f"leak-{leak['mistake_type']}",
-                    on_click=navigate_to_diagnostics,
-                    args=(leak["mistake_type"],),
-                )
-
-        st.markdown("#### Equity curve + drawdown (realized)")
-        st.line_chart(curve.set_index("close_date")[["cum_net", "drawdown"]])
-
-        st.markdown("#### Daily P&L calendar (realized)")
-        if daily_pnl.empty:
-            st.info("No closed trades available to build the daily calendar.")
-        else:
-            daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
-            month_options = sorted(daily_pnl["month"].unique().tolist())
-            default_month = pd.to_datetime(trades_sheet["close_date"]).max().strftime("%Y-%m")
-            default_index = month_options.index(default_month) if default_month in month_options else len(month_options) - 1
-            month_sel = st.selectbox("Month", options=month_options, index=default_index, key="overview-month")
-            selected_day = render_pnl_calendar(daily_pnl, month_sel)
-            if selected_day:
-                st.caption(f"Trades closed on {selected_day:%Y-%m-%d}")
-
-        st.markdown("#### Top tickers")
-        by_ticker = (trades_sheet.groupby("underlying", as_index=False)
-                     .agg(net_pnl=("net_pnl", "sum"))
-                     .sort_values("net_pnl", ascending=False))
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Top 5 winners**")
-            st.dataframe(by_ticker.head(5), use_container_width=True)
-        with c2:
-            st.markdown("**Top 5 losers**")
-            st.dataframe(by_ticker.tail(5).sort_values("net_pnl"), use_container_width=True)
-
-        if st.session_state["user"]:
-            summary_payload = {
-                "realized_pnl": pnl_total,
-                "win_rate": winrate,
-                "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else None,
-                "max_drawdown": abs(max_dd),
-                "trade_count": len(trades_sheet),
-                "avg_win": avg_win,
-                "avg_loss": avg_loss,
-                "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
-                "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
-            }
-            if st.button("Save run"):
-                save_run_summary(st.session_state["user"]["id"], summary_payload)
-                st.success("Run saved to your account.")
-        else:
-            st.info("Sign in to save runs and view history.")
-
-elif nav_selection == "Journal":
-    st.markdown("### Journal (realized trades)")
-    if trades_sheet.empty:
-        st.info("No closed trades to analyze.")
-    else:
-        journal_data = trades_sheet.copy()
-        if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
-            cutoff = journal_data["close_date"].max() - pd.Timedelta(days=30)
-            journal_data = journal_data[journal_data["close_date"] >= cutoff]
-            st.caption("Free tier: showing the last 30 days. Upgrade to unlock full history.")
-
-        journal_data["position_type"] = np.where(journal_data["sell_date"] < journal_data["buy_date"], "SHORT", "LONG")
-        with st.expander("Filters", expanded=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                under_sel = st.multiselect("Underlying", options=sorted(journal_data["underlying"].unique().tolist()),
-                                           default=sorted(journal_data["underlying"].unique().tolist()))
-            with c2:
-                right_sel = st.multiselect("Type (C/P/Stock)", options=sorted(journal_data["right"].unique().tolist()),
-                                           default=sorted(journal_data["right"].unique().tolist()))
-            with c3:
-                pos_sel = st.multiselect("Position (SHORT/LONG)", options=sorted(journal_data["position_type"].unique().tolist()),
-                                         default=sorted(journal_data["position_type"].unique().tolist()))
-        filtered = journal_data[
-            journal_data["underlying"].isin(under_sel)
-            & journal_data["right"].isin(right_sel)
-            & journal_data["position_type"].isin(pos_sel)
-        ].copy()
-        if filtered.empty:
-            st.warning("No trades match your filters.")
-        else:
-            st.dataframe(
-                filtered.sort_values("close_date", ascending=False).head(200),
-                use_container_width=True,
-            )
-            st.caption("Showing top 200 rows. Download full data from Export.")
-
-elif nav_selection == "Options":
-    if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
-        st.warning("Options view is part of the paid plan. Upgrade to unlock.")
-    else:
-        st.markdown("### Options & Open Positions")
-        if openpos.empty:
-            st.info("No open positions detected.")
-        else:
-            if mark_data_available:
-                st.success("Mark data available — unrealized P&L shown separately.")
-            else:
-                st.warning("Unrealized P&L not available yet (no mark data).")
-            st.dataframe(openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]), use_container_width=True)
-
+    render_overview(data)
+elif nav_selection == "Rules Coach":
+    render_rules_coach(data)
+elif nav_selection == "Calendar":
+    render_calendar(data)
 elif nav_selection == "Diagnostics":
-    if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
-        st.warning("Diagnostics are part of the paid plan. Upgrade to unlock.")
-    else:
-        st.markdown("### Diagnostics & Mistake Detector")
-        render_rules_coach_diagnostics(trades_sheet, work)
-        mistakes_df = mistake_output["mistakes_df"]
-        summary_by_type = mistake_output["summary_by_type"]
-        summary_by_week = mistake_output["summary_by_week"]
-        examples_by_type = mistake_output["examples_by_type"]
-        held_tables = mistake_output["held_tables"]
-
-        if trades_sheet.empty:
-            st.info("No closed trades to analyze for mistakes.")
-        elif mistakes_df.empty:
-            st.info("No mistakes detected with current rules.")
-        else:
-            st.dataframe(summary_by_type, use_container_width=True)
-            if not summary_by_week.empty:
-                top_types = summary_by_type.head(3)["mistake_type"].tolist()
-                weekly = summary_by_week[summary_by_week["mistake_type"].isin(top_types)]
-                weekly_pivot = weekly.pivot(index="week_key", columns="mistake_type", values="total_damage").fillna(0)
-                st.line_chart(weekly_pivot)
-
-            type_options = summary_by_type["mistake_type"].tolist()
-            default_type = st.session_state.get("diagnostics_mistake_type")
-            default_index = type_options.index(default_type) if default_type in type_options else 0
-            type_sel = st.selectbox("Mistake type", type_options, index=default_index)
-            examples = examples_by_type[examples_by_type["mistake_type"] == type_sel].head(20).copy()
-            examples["date"] = examples["close_date"].dt.date
-            st.dataframe(examples[["date", "underlying", "contract_key", "net_pnl", "severity", "details"]], use_container_width=True)
-
-            if not examples.empty:
-                ex_idx = st.selectbox(
-                    "Inspect example row",
-                    examples.index.tolist(),
-                    format_func=lambda i: f"{examples.loc[i, 'date']} | {examples.loc[i, 'details']}",
-                )
-                selected = examples.loc[ex_idx]
-                trades_view = trades_sheet.copy()
-                trades_view["close_date"] = trades_view[["buy_date", "sell_date"]].max(axis=1)
-                trades_view["contract_key"] = _contract_key(trades_view)
-
-                if type_sel == "Overtrading day":
-                    trades_view = trades_view[trades_view["close_date"].dt.date == selected["date"]]
-                elif type_sel == "Gave back gains in ticker":
-                    trades_view = trades_view[trades_view["underlying"] == selected["underlying"]]
-                elif type_sel == "Big loss outlier":
-                    trades_view = trades_view[trades_view["trade_id"] == selected["trade_id"]]
-                elif type_sel == "Averaged down (added to loser)":
-                    trades_view = trades_view[trades_view["contract_key"] == selected["contract_key"]]
-                st.markdown("#### Related closed trades")
-                st.dataframe(trades_view.sort_values("close_date"), use_container_width=True)
-
-            if "losers" in held_tables and "winners" in held_tables:
-                st.markdown("### Holding time contrast")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.dataframe(held_tables["losers"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
-                with c2:
-                    st.dataframe(held_tables["winners"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
-
+    render_diagnostics(data)
 elif nav_selection == "Export":
     if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
         st.warning("Export is part of the paid plan. Upgrade to unlock.")
     else:
-        st.markdown("### Export")
-        with st.expander("Parsed trades (raw)", expanded=False):
-            st.dataframe(
-                work[["trade_dt", "asset_type", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80),
-                use_container_width=True,
-            )
-
-        if not trades_sheet.empty:
-            with st.expander("Dashboard (realized)", expanded=False):
-                dash = (trades_sheet.groupby("underlying", as_index=False)
-                        .agg(net_pnl=("net_pnl", "sum"), gross_pnl=("gross_pnl", "sum"), fees=("fees", "sum"))
-                        ).sort_values("net_pnl", ascending=False)
-                st.dataframe(dash, use_container_width=True)
-
-        with st.expander("Export Excel", expanded=True):
-            fname = st.text_input("Output filename", "trade_analysis.xlsx")
-
-            def to_excel_bytes():
-                import io as _io
-                from openpyxl.styles import PatternFill, Font
-                from openpyxl.utils import get_column_letter
-
-                buf = _io.BytesIO()
-
-                dash = pd.DataFrame()
-                if not trades_sheet.empty:
-                    dash = (trades_sheet.groupby("underlying", as_index=False)
-                            .agg(net_pnl=("net_pnl", "sum"), gross_pnl=("gross_pnl", "sum"), fees=("fees", "sum"))
-                            ).sort_values("net_pnl", ascending=False)
-
-                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    if not dash.empty:
-                        dash.to_excel(writer, sheet_name="Dashboard", index=False)
-                    if not trades_sheet.empty:
-                        trades_sheet.to_excel(writer, sheet_name="Trades", index=False)
-                    if not spy_trades.empty:
-                        spy_trades.to_excel(writer, sheet_name="SPY", index=False)
-                    if not openpos.empty:
-                        openpos.to_excel(writer, sheet_name="OpenPositions", index=False)
-
-                    work.to_excel(writer, sheet_name="RawParsed", index=False)
-
-                    wb = writer.book
-
-                    if "Trades" in wb.sheetnames:
-                        ws = wb["Trades"]
-                        headers = [cell.value for cell in ws[1]]
-                        if "underlying" in headers:
-                            idx = headers.index("underlying") + 1
-                            fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                            for r in range(2, ws.max_row + 1):
-                                if ws.cell(row=r, column=idx).value == "SPY":
-                                    for c in range(1, ws.max_column + 1):
-                                        ws.cell(row=r, column=c).fill = fill
-                        for col in range(1, min(ws.max_column, 20) + 1):
-                            ws.column_dimensions[get_column_letter(col)].width = 16
-
-                    if "SPY" in wb.sheetnames:
-                        ws = wb["SPY"]
-                        last = ws.max_row + 2
-                        ws.cell(row=last, column=1).value = "SPY net total (closed)"
-                        ws.cell(row=last, column=2).value = spy_total
-                        ws.cell(row=last, column=1).font = Font(bold=True)
-                        ws.cell(row=last, column=2).font = Font(bold=True)
-
-                buf.seek(0)
-                return buf.getvalue()
-
-            if st.button("Generate Excel"):
-                st.download_button(
-                    "Download Excel",
-                    data=to_excel_bytes(),
-                    file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                log_event("export_clicked", details={"type": "excel"}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
-                st.success("Generated Excel.")
-
-        st.markdown("### Share my month (PNG)")
-        if daily_pnl.empty:
-            st.info("Need closed trades to generate a shareable month summary.")
-        else:
-            daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
-            month_options = sorted(daily_pnl["month"].unique().tolist())
-            month_sel = st.selectbox("Month to share", month_options, index=len(month_options) - 1, key="share-month")
-            summary_by_type = mistake_output["summary_by_type"]
-            top_leaks = summary_by_type.head(3).to_dict("records") if not summary_by_type.empty else []
-            by_ticker = (trades_sheet.groupby("underlying", as_index=False)
-                         .agg(net_pnl=("net_pnl", "sum"))
-                         .sort_values("net_pnl", ascending=False))
-            summary_payload = {
-                "realized_pnl": float(trades_sheet["net_pnl"].sum()),
-                "max_drawdown": abs(float(trades_sheet.sort_values("close_date")["net_pnl"].cumsum().sub(
-                    trades_sheet.sort_values("close_date")["net_pnl"].cumsum().cummax()).min())),
-                "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
-                "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
-            }
-            png_bytes = build_share_image(daily_pnl[daily_pnl["month"] == month_sel], month_sel, summary_payload, top_leaks)
-            st.download_button(
-                "Download shareable PNG",
-                data=png_bytes,
-                file_name=f"trade-summary-{month_sel}.png",
-                mime="image/png",
-            )
-
+        render_export(data)
 elif nav_selection == "Settings":
-    st.markdown("### Settings")
     if st.session_state["user"]:
         st.success(f"Signed in as {st.session_state['user']['email']}")
         if st.button("Sign out"):
@@ -2624,7 +2859,7 @@ elif nav_selection == "Settings":
                 st.session_state["user"]["is_subscribed"] = 1
                 st.success("Subscription activated.")
             else:
-                st.caption("Upgrade to unlock Diagnostics, Options, and Export.")
+                st.caption("Upgrade to unlock Diagnostics and Export.")
 
         st.markdown("#### Saved runs")
         runs_df = load_run_summaries(st.session_state["user"]["id"])
@@ -2659,3 +2894,6 @@ elif nav_selection == "Settings":
                 if not error_events.empty:
                     st.markdown("**Top errors**")
                     st.dataframe(error_events.head(20), use_container_width=True)
+
+    st.session_state["settings"] = render_settings(st.session_state.get("settings", {}))
+    st.session_state["include_stocks_toggle"] = st.session_state["settings"]["toggles"]["include_stocks"]
