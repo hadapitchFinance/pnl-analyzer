@@ -804,8 +804,14 @@ def compute_equity_curve(closed_trades: pd.DataFrame) -> Tuple[pd.DataFrame, flo
 def _ensure_trade_id(trades: pd.DataFrame) -> pd.DataFrame:
     base = trades.copy()
     if "trade_id" not in base.columns:
-        base["trade_id"] = base.index.astype(str)
-    base["trade_id"] = base["trade_id"].fillna(base.index.astype(str)).astype(str)
+        base["trade_id"] = pd.Series(base.index.astype(str), index=base.index)
+        return base
+    trade_id = base["trade_id"]
+    if not pd.api.types.is_string_dtype(trade_id):
+        trade_id = trade_id.astype("string")
+    fallback_ids = pd.Series(base.index.astype(str), index=base.index, dtype="string")
+    base["trade_id"] = trade_id.where(trade_id.notna(), fallback_ids)
+    base["trade_id"] = base["trade_id"].astype(str)
     return base
 
 def _prepare_closed_trades(trades: pd.DataFrame) -> pd.DataFrame:
