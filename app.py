@@ -781,6 +781,508 @@ def compute_daily_pnl(closed_trades: pd.DataFrame) -> pd.DataFrame:
                   loss_count=("net_pnl", lambda s: int((s < 0).sum()))))
     return daily
 
+def compute_equity_curve(closed_trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
+    if closed_trades.empty:
+        empty = pd.DataFrame(columns=["trade_day", "daily_pnl", "cum_pnl", "peak", "drawdown"])
+        return empty, 0.0
+
+    base = closed_trades.copy()
+    base["close_date"] = pd.to_datetime(base["close_date"], errors="coerce")
+    base["net_pnl"] = pd.to_numeric(base["net_pnl"], errors="coerce").fillna(0.0)
+    base = base[base["close_date"].notna()].copy()
+    base["trade_day"] = base["close_date"].dt.date
+
+    daily = (base.groupby("trade_day", as_index=False)
+             .agg(daily_pnl=("net_pnl", "sum"))
+             .sort_values("trade_day"))
+    daily["cum_pnl"] = daily["daily_pnl"].cumsum()
+    daily["peak"] = daily["cum_pnl"].cummax()
+    daily["drawdown"] = daily["peak"] - daily["cum_pnl"]
+    max_drawdown = float(daily["drawdown"].max()) if not daily.empty else 0.0
+    return daily, max_drawdown
+
+def _ensure_trade_id(trades: pd.DataFrame) -> pd.DataFrame:
+    base = trades.copy()
+    if "trade_id" not in base.columns:
+        base["trade_id"] = base.index.astype(str)
+    base["trade_id"] = base["trade_id"].fillna(base.index.astype(str)).astype(str)
+    return base
+
+def _prepare_closed_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    base = _ensure_trade_id(trades)
+    base["row_order"] = np.arange(len(base))
+    if "open_date" not in base.columns and {"buy_date", "sell_date"}.issubset(base.columns):
+        base["open_date"] = base[["buy_date", "sell_date"]].min(axis=1)
+    base["open_date"] = pd.to_datetime(base["open_date"], errors="coerce")
+    base["close_date"] = pd.to_datetime(base["close_date"], errors="coerce")
+    base["net_pnl"] = pd.to_numeric(base["net_pnl"], errors="coerce").fillna(0.0)
+    base["trade_day"] = base["close_date"].dt.date
+    base["contract_key"] = _contract_key(base)
+    base["hold_days"] = (base["close_date"] - base["open_date"]).dt.total_seconds() / (24 * 3600)
+    return base
+
+def _compute_rule_defaults(trades: pd.DataFrame) -> Dict[str, float]:
+    if trades.empty:
+        return {"max_loss": 0.0, "red_day_limit": 0.0}
+    losers = trades[trades["net_pnl"] < 0]
+    max_loss = float(2 * np.median(np.abs(losers["net_pnl"]))) if not losers.empty else 0.0
+    daily = compute_daily_pnl(trades)
+    red_days = daily[daily["day_pnl"] < 0]
+    red_day_limit = float(np.median(np.abs(red_days["day_pnl"]))) if not red_days.empty else 0.0
+    return {"max_loss": max_loss, "red_day_limit": red_day_limit}
+
+def _collapse_fill_events(fills: pd.DataFrame) -> pd.DataFrame:
+    fills_work = fills.copy()
+    fills_work["fill_dt"] = pd.to_datetime(fills_work["trade_dt"], errors="coerce")
+    fills_work["side"] = fills_work["side"].astype(str).str.upper()
+    fills_work["qty"] = pd.to_numeric(fills_work["qty"], errors="coerce").fillna(0.0)
+    fills_work["price"] = pd.to_numeric(fills_work["price"], errors="coerce").fillna(0.0)
+    fills_work["contract_key"] = _contract_key(fills_work)
+    fills_work["signed_qty"] = np.where(fills_work["side"].eq("BUY"), fills_work["qty"], -fills_work["qty"])
+    fills_work["fill_date"] = fills_work["fill_dt"].dt.date
+    fills_work["row_order"] = np.arange(len(fills_work))
+
+    if "order_id" in fills_work.columns and fills_work["order_id"].notna().any():
+        grouped = (fills_work.groupby(["contract_key", "order_id", "side"], as_index=False)
+                   .agg(signed_qty=("signed_qty", "sum"),
+                        fill_dt=("fill_dt", "min"),
+                        row_order=("row_order", "min")))
+    else:
+        grouped = (fills_work.groupby(["contract_key", "fill_date", "side", "price"], as_index=False)
+                   .agg(signed_qty=("signed_qty", "sum"),
+                        fill_dt=("fill_dt", "min"),
+                        row_order=("row_order", "min")))
+    grouped = grouped.sort_values(["contract_key", "fill_dt", "row_order"])
+    return grouped
+
+def _merge_equity_curves(base_curve: pd.DataFrame, sim_curve: pd.DataFrame) -> pd.DataFrame:
+    merged = pd.merge(
+        base_curve[["trade_day", "daily_pnl"]],
+        sim_curve[["trade_day", "daily_pnl"]],
+        on="trade_day",
+        how="outer",
+        suffixes=("_baseline", "_simulated"),
+    ).sort_values("trade_day")
+    merged["daily_pnl_baseline"] = merged["daily_pnl_baseline"].fillna(0.0)
+    merged["daily_pnl_simulated"] = merged["daily_pnl_simulated"].fillna(0.0)
+    merged["baseline_cum_pnl"] = merged["daily_pnl_baseline"].cumsum()
+    merged["simulated_cum_pnl"] = merged["daily_pnl_simulated"].cumsum()
+    merged["baseline_peak"] = merged["baseline_cum_pnl"].cummax()
+    merged["simulated_peak"] = merged["simulated_cum_pnl"].cummax()
+    merged["baseline_drawdown"] = merged["baseline_peak"] - merged["baseline_cum_pnl"]
+    merged["simulated_drawdown"] = merged["simulated_peak"] - merged["simulated_cum_pnl"]
+    return merged
+
+def simulate_rules(
+    closed_trades: pd.DataFrame,
+    fills: Optional[pd.DataFrame],
+    params: Optional[Dict[str, float]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], Dict[str, Any]]:
+    if closed_trades.empty:
+        empty = closed_trades.copy()
+        empty["sim_net_pnl"] = []
+        empty["rules_applied"] = []
+        return empty, pd.DataFrame(), {"baseline_pnl": 0.0, "max_drawdown": 0.0}, {
+            "simulated_pnl": 0.0,
+            "max_drawdown": 0.0,
+            "rule_summaries": {},
+            "equity_curve": pd.DataFrame(),
+        }
+
+    base = _prepare_closed_trades(closed_trades)
+    base["baseline_net_pnl"] = base["net_pnl"]
+    base["sim_net_pnl"] = base["net_pnl"]
+    base["rules_applied"] = [[] for _ in range(len(base))]
+
+    overrides: List[Dict[str, object]] = []
+    rule_summaries: Dict[str, Dict[str, object]] = {}
+    params = params or {}
+
+    # Rule 1: No Averaging Down
+    rule1_name = "Rule 1 — No Averaging Down"
+    if fills is None or fills.empty:
+        rule_summaries["rule1"] = {
+            "name": rule1_name,
+            "status": "unavailable",
+            "message": "Rule 1 unavailable: requires fills (BUY/SELL events).",
+            "violations": 0,
+            "baseline_cost": 0.0,
+            "simulated_savings": 0.0,
+            "affected_trades": pd.DataFrame(),
+        }
+    else:
+        events = _collapse_fill_events(fills)
+        add_counts: Dict[str, int] = {}
+        for contract_key, g in events.groupby("contract_key", sort=False):
+            signed_qty = g["signed_qty"].astype(float)
+            pos_before = signed_qty.cumsum().shift(1).fillna(0.0)
+            pos_after = pos_before + signed_qty
+            same_sign = np.sign(pos_before) == np.sign(pos_after)
+            add_events = (pos_before != 0) & same_sign & (pos_after.abs() > pos_before.abs())
+            add_counts[contract_key] = int(add_events.sum())
+
+        base_contract_net = base.groupby("contract_key")["net_pnl"].sum()
+        violating_contracts = [
+            ck for ck, count in add_counts.items()
+            if count >= 1 and base_contract_net.get(ck, 0.0) < 0
+        ]
+        for contract_key in violating_contracts:
+            add_count = add_counts.get(contract_key, 0)
+            entry_units = 1 + add_count
+            contract_rows = base[base["contract_key"] == contract_key].copy()
+            baseline_contract_net = float(contract_rows["net_pnl"].sum())
+            simulated_contract_net = baseline_contract_net / entry_units if entry_units else baseline_contract_net
+            abs_sum = float(contract_rows["net_pnl"].abs().sum())
+            if abs_sum == 0:
+                weights = np.repeat(1 / len(contract_rows), len(contract_rows))
+            else:
+                weights = contract_rows["net_pnl"].abs() / abs_sum
+            for idx, weight in zip(contract_rows.index, weights):
+                prev = float(base.at[idx, "sim_net_pnl"])
+                new_value = float(simulated_contract_net * weight)
+                base.at[idx, "sim_net_pnl"] = new_value
+                if prev != new_value:
+                    base.at[idx, "rules_applied"].append(rule1_name)
+                    overrides.append({
+                        "trade_id": base.at[idx, "trade_id"],
+                        "rule_name": rule1_name,
+                        "baseline_net_pnl": prev,
+                        "simulated_net_pnl": new_value,
+                        "delta": new_value - prev,
+                        "override_reason": "Scaled by entry units (approximation)",
+                    })
+
+        affected = base[base["contract_key"].isin(violating_contracts)].copy()
+        if not affected.empty:
+            affected["override_reason"] = "Scaled by entry units (approximation)"
+        baseline_cost = float(affected["baseline_net_pnl"].sum()) if not affected.empty else 0.0
+        simulated_cost = float(affected["sim_net_pnl"].sum()) if not affected.empty else 0.0
+        rule_summaries["rule1"] = {
+            "name": rule1_name,
+            "status": "active",
+            "message": "Approximation by scaling to remove adds.",
+            "violations": len(violating_contracts),
+            "baseline_cost": baseline_cost,
+            "simulated_savings": baseline_cost - simulated_cost,
+            "affected_trades": affected,
+        }
+
+    # Rule 2: Max Loss Per Trade Cap
+    rule2_name = "Rule 2 — Max Loss Per Trade Cap"
+    max_loss = params.get("max_loss")
+    losers = base[base["net_pnl"] < 0]
+    if max_loss is None:
+        max_loss = float(2 * np.median(np.abs(losers["net_pnl"]))) if not losers.empty else 0.0
+    if max_loss <= 0:
+        rule_summaries["rule2"] = {
+            "name": rule2_name,
+            "status": "unavailable",
+            "message": "Rule 2 unavailable: no losing trades to set a cap.",
+            "violations": 0,
+            "baseline_cost": 0.0,
+            "simulated_savings": 0.0,
+            "affected_trades": pd.DataFrame(),
+        }
+    else:
+        violating = base[base["net_pnl"] < -max_loss].copy()
+        for idx in violating.index:
+            prev = float(base.at[idx, "sim_net_pnl"])
+            new_value = float(-max_loss)
+            base.at[idx, "sim_net_pnl"] = new_value
+            if prev != new_value:
+                base.at[idx, "rules_applied"].append(rule2_name)
+                overrides.append({
+                    "trade_id": base.at[idx, "trade_id"],
+                    "rule_name": rule2_name,
+                    "baseline_net_pnl": prev,
+                    "simulated_net_pnl": new_value,
+                    "delta": new_value - prev,
+                    "override_reason": f"Clamped to -${max_loss:,.2f}",
+                })
+
+        baseline_cost = float(violating["baseline_net_pnl"].sum()) if not violating.empty else 0.0
+        simulated_cost = float(base.loc[violating.index, "sim_net_pnl"].sum()) if not violating.empty else 0.0
+        affected = base.loc[violating.index].copy()
+        if not affected.empty:
+            affected["override_reason"] = f"Clamped to -${max_loss:,.2f}"
+        rule_summaries["rule2"] = {
+            "name": rule2_name,
+            "status": "active",
+            "message": f"Cap applied at -${max_loss:,.2f}.",
+            "violations": len(violating),
+            "baseline_cost": baseline_cost,
+            "simulated_savings": baseline_cost - simulated_cost,
+            "affected_trades": affected,
+            "max_loss": max_loss,
+        }
+
+    # Rule 3: Stop Trading After Red Day Limit
+    rule3_name = "Rule 3 — Stop Trading After Red Day Limit"
+    red_day_limit = params.get("red_day_limit")
+    daily = compute_daily_pnl(base)
+    red_days = daily[daily["day_pnl"] < 0]
+    if red_day_limit is None:
+        red_day_limit = float(np.median(np.abs(red_days["day_pnl"]))) if not red_days.empty else 0.0
+    if red_day_limit <= 0 or red_days.empty:
+        rule_summaries["rule3"] = {
+            "name": rule3_name,
+            "status": "unavailable",
+            "message": "Rule 3 unavailable: no red days to set a limit.",
+            "violations": 0,
+            "baseline_cost": 0.0,
+            "simulated_savings": 0.0,
+            "affected_trades": pd.DataFrame(),
+        }
+    else:
+        trigger_days = daily[daily["day_pnl"] <= -red_day_limit]["trade_day"].tolist()
+        skipped_indices: List[int] = []
+        for trade_day in trigger_days:
+            day_trades = base[base["trade_day"] == trade_day].sort_values(["close_date", "row_order"])
+            day_trades["cum_pnl"] = day_trades["net_pnl"].cumsum()
+            hit = day_trades[day_trades["cum_pnl"] <= -red_day_limit]
+            if hit.empty:
+                continue
+            cutoff_idx = hit.index[0]
+            after = day_trades.loc[day_trades.index > cutoff_idx]
+            skipped_indices.extend(after.index.tolist())
+
+        skipped = base.loc[sorted(set(skipped_indices))].copy()
+        for idx in skipped.index:
+            prev = float(base.at[idx, "sim_net_pnl"])
+            new_value = 0.0
+            base.at[idx, "sim_net_pnl"] = new_value
+            if prev != new_value:
+                base.at[idx, "rules_applied"].append(rule3_name)
+                overrides.append({
+                    "trade_id": base.at[idx, "trade_id"],
+                    "rule_name": rule3_name,
+                    "baseline_net_pnl": prev,
+                    "simulated_net_pnl": new_value,
+                    "delta": new_value - prev,
+                    "override_reason": "Skipped after red-day limit hit",
+                })
+
+        baseline_cost = float(skipped["baseline_net_pnl"].sum()) if not skipped.empty else 0.0
+        simulated_cost = float(base.loc[skipped.index, "sim_net_pnl"].sum()) if not skipped.empty else 0.0
+        affected = base.loc[skipped.index].copy()
+        if not affected.empty:
+            affected["override_reason"] = "Skipped after red-day limit hit"
+        rule_summaries["rule3"] = {
+            "name": rule3_name,
+            "status": "active",
+            "message": f"Limit applied at -${red_day_limit:,.2f} per day.",
+            "violations": len(skipped),
+            "baseline_cost": baseline_cost,
+            "simulated_savings": baseline_cost - simulated_cost,
+            "affected_trades": affected,
+            "red_day_limit": red_day_limit,
+            "trigger_days": trigger_days,
+        }
+
+    overrides_df = pd.DataFrame(overrides)
+    if overrides_df.empty:
+        overrides_df = pd.DataFrame(columns=[
+            "trade_id", "rule_name", "baseline_net_pnl", "simulated_net_pnl", "delta", "override_reason"
+        ])
+
+    baseline_curve, baseline_max_dd = compute_equity_curve(base)
+    sim_curve, sim_max_dd = compute_equity_curve(base.assign(net_pnl=base["sim_net_pnl"]))
+    sim_equity_curve = _merge_equity_curves(baseline_curve, sim_curve)
+
+    baseline_metrics = {
+        "baseline_pnl": float(base["net_pnl"].sum()),
+        "max_drawdown": float(baseline_max_dd),
+    }
+    sim_metrics = {
+        "simulated_pnl": float(base["sim_net_pnl"].sum()),
+        "max_drawdown": float(sim_max_dd),
+        "rule_summaries": rule_summaries,
+        "equity_curve": sim_equity_curve,
+    }
+    return base, overrides_df, baseline_metrics, sim_metrics
+
+def render_rules_coach_overview(
+    closed_trades: pd.DataFrame,
+    fills: Optional[pd.DataFrame],
+) -> None:
+    st.markdown("#### If you followed 3 rules, here’s the improvement")
+    if closed_trades.empty:
+        st.info("Upload closed trades to run the Rules Coach simulator.")
+        return
+
+    prepared = _prepare_closed_trades(closed_trades)
+    defaults = _compute_rule_defaults(prepared)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        max_loss = st.number_input(
+            "MAX_LOSS ($)",
+            min_value=0.0,
+            value=float(st.session_state.get("rules_max_loss", defaults["max_loss"])),
+            step=10.0,
+            help="Rule 2 cap for worst per-trade loss.",
+            key="rules_max_loss_overview",
+        )
+        st.session_state["rules_max_loss"] = max_loss
+    with c2:
+        red_day_limit = st.number_input(
+            "RED_DAY_LIMIT ($)",
+            min_value=0.0,
+            value=float(st.session_state.get("rules_red_day_limit", defaults["red_day_limit"])),
+            step=10.0,
+            help="Rule 3 stop-trading limit for red days.",
+            key="rules_red_day_limit_overview",
+        )
+        st.session_state["rules_red_day_limit"] = red_day_limit
+
+    sim_trades, overrides_df, baseline_metrics, sim_metrics = simulate_rules(
+        prepared,
+        fills,
+        params={"max_loss": max_loss, "red_day_limit": red_day_limit},
+    )
+
+    baseline_pnl = baseline_metrics["baseline_pnl"]
+    sim_pnl = sim_metrics["simulated_pnl"]
+    pnl_delta = sim_pnl - baseline_pnl
+    base_dd = baseline_metrics["max_drawdown"]
+    sim_dd = sim_metrics["max_drawdown"]
+    dd_delta = base_dd - sim_dd
+
+    render_stat_cards(
+        [
+            {"label": "Baseline realized P&L", "value": f"${baseline_pnl:,.2f}", "sub": "Closed trades only"},
+            {"label": "Simulated realized P&L", "value": f"${sim_pnl:,.2f}", "sub": "After 3 rules"},
+            {"label": "Delta", "value": f"${pnl_delta:,.2f}", "sub": "Improvement"},
+            {"label": "Baseline max drawdown", "value": f"${base_dd:,.2f}", "sub": "Realized equity"},
+            {"label": "Simulated max drawdown", "value": f"${sim_dd:,.2f}", "sub": "Rules applied"},
+            {"label": "Drawdown reduction", "value": f"${dd_delta:,.2f}", "sub": "Improvement"},
+        ]
+    )
+
+    st.caption("Simulations are deterministic approximations based on your realized trades; no market data is used.")
+    st.caption("Rule 1 uses a scaling approximation when removing adds because per-unit P&L is unavailable.")
+
+    rule_summaries = sim_metrics.get("rule_summaries", {})
+    st.markdown("#### Rule cards")
+    rule_cols = st.columns(3)
+    for col, key in zip(rule_cols, ["rule1", "rule2", "rule3"]):
+        summary = rule_summaries.get(key, {})
+        with col:
+            st.markdown(f"**{summary.get('name', key)}**")
+            if summary.get("status") == "unavailable":
+                st.warning(summary.get("message", "Rule unavailable."))
+            else:
+                st.markdown(f"Violations: **{summary.get('violations', 0)}**")
+                st.markdown(f"Cost: **${summary.get('baseline_cost', 0.0):,.2f}**")
+                st.markdown(f"Simulated savings: **${summary.get('simulated_savings', 0.0):,.2f}**")
+                if summary.get("message"):
+                    st.caption(summary["message"])
+
+            if st.button("View affected trades", key=f"view-affected-{key}"):
+                st.session_state["rules_coach_selected_rule"] = key
+
+    selected_rule = st.session_state.get("rules_coach_selected_rule")
+    if selected_rule and rule_summaries.get(selected_rule):
+        summary = rule_summaries[selected_rule]
+        affected = summary.get("affected_trades", pd.DataFrame()).copy()
+        if affected.empty:
+            st.info("No affected trades for this rule.")
+        else:
+            affected = affected.assign(
+                simulated_net_pnl=affected["sim_net_pnl"],
+                delta=affected["sim_net_pnl"] - affected["baseline_net_pnl"],
+            )
+            st.markdown("#### Affected trades")
+            st.dataframe(
+                affected[[
+                    "trade_id",
+                    "open_date",
+                    "close_date",
+                    "contract_key",
+                    "baseline_net_pnl",
+                    "simulated_net_pnl",
+                    "delta",
+                    "override_reason",
+                ]].sort_values("close_date", ascending=False),
+                use_container_width=True,
+            )
+
+def render_rules_coach_diagnostics(
+    closed_trades: pd.DataFrame,
+    fills: Optional[pd.DataFrame],
+) -> None:
+    st.markdown("### Rules Coach Details")
+    if closed_trades.empty:
+        st.info("Upload closed trades to run the Rules Coach simulator.")
+        return
+
+    prepared = _prepare_closed_trades(closed_trades)
+    defaults = _compute_rule_defaults(prepared)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        max_loss = st.number_input(
+            "MAX_LOSS ($)",
+            min_value=0.0,
+            value=float(st.session_state.get("rules_max_loss", defaults["max_loss"])),
+            step=10.0,
+            key="rules_max_loss_diagnostics",
+        )
+    with c2:
+        red_day_limit = st.number_input(
+            "RED_DAY_LIMIT ($)",
+            min_value=0.0,
+            value=float(st.session_state.get("rules_red_day_limit", defaults["red_day_limit"])),
+            step=10.0,
+            key="rules_red_day_limit_diagnostics",
+        )
+    st.session_state["rules_max_loss"] = max_loss
+    st.session_state["rules_red_day_limit"] = red_day_limit
+
+    sim_trades, overrides_df, baseline_metrics, sim_metrics = simulate_rules(
+        prepared,
+        fills,
+        params={"max_loss": max_loss, "red_day_limit": red_day_limit},
+    )
+    sim_trades["rules_applied"] = sim_trades["rules_applied"].apply(lambda rules: ", ".join(rules) if rules else "—")
+
+    st.caption("Simulations are deterministic approximations based on your realized trades; no market data is used.")
+    st.markdown("#### Affected trades")
+    affected = sim_trades[sim_trades["sim_net_pnl"] != sim_trades["baseline_net_pnl"]].copy()
+    if affected.empty:
+        st.info("No trades were modified by the rule simulation.")
+    else:
+        affected = affected.assign(delta=affected["sim_net_pnl"] - affected["baseline_net_pnl"])
+        st.dataframe(
+            affected[[
+                "trade_id",
+                "trade_day",
+                "contract_key",
+                "baseline_net_pnl",
+                "sim_net_pnl",
+                "delta",
+                "rules_applied",
+            ]].sort_values("trade_day", ascending=False),
+            use_container_width=True,
+        )
+
+    st.markdown("#### Equity curve comparison")
+    equity_curve = sim_metrics.get("equity_curve", pd.DataFrame())
+    if not equity_curve.empty:
+        st.line_chart(
+            equity_curve.set_index("trade_day")[["baseline_cum_pnl", "simulated_cum_pnl"]],
+        )
+        st.markdown("#### Drawdown comparison")
+        st.line_chart(
+            equity_curve.set_index("trade_day")[["baseline_drawdown", "simulated_drawdown"]],
+        )
+
+    st.markdown("#### Simulation audit trail")
+    if overrides_df.empty:
+        st.info("No overrides were applied.")
+    else:
+        st.dataframe(overrides_df.sort_values("trade_id"), use_container_width=True)
+
 def apply_day_filter(closed_trades: pd.DataFrame, selected_day: Optional[date]) -> pd.DataFrame:
     if closed_trades.empty or selected_day is None:
         return closed_trades
@@ -1546,6 +2048,8 @@ if nav_selection == "Overview":
             ]
         )
 
+        render_rules_coach_overview(trades_sheet, work)
+
         c1, c2 = st.columns([2, 1])
         with c1:
             st.markdown("#### Equity curve + drawdown (realized)")
@@ -1670,6 +2174,7 @@ elif nav_selection == "Diagnostics":
         st.warning("Diagnostics are part of the paid plan. Upgrade to unlock.")
     else:
         st.markdown("### Diagnostics & Mistake Detector")
+        render_rules_coach_diagnostics(trades_sheet, work)
         mistakes_df = mistake_output["mistakes_df"]
         summary_by_type = mistake_output["summary_by_type"]
         summary_by_week = mistake_output["summary_by_week"]
