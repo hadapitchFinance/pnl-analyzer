@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -16,7 +17,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Trade Analyzer (IBKR + Fidelity)", layout="wide")
+st.set_page_config(page_title="Trade Analyzer Pro", layout="wide")
 
 st.markdown(
     """
@@ -106,6 +107,38 @@ st.markdown(
             background: rgba(15, 23, 42, 0.6);
             border: 1px solid rgba(148, 163, 184, 0.2);
         }
+        .pill-ok {
+            color: #22c55e;
+        }
+        .pill-warn {
+            color: #f59e0b;
+        }
+        .pill-error {
+            color: #f87171;
+        }
+        .nav-segment label {
+            margin-bottom: 0;
+        }
+        .nav-segment div[role="radiogroup"] {
+            background: rgba(15, 23, 42, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 999px;
+            padding: 4px;
+            gap: 6px;
+        }
+        .nav-segment div[role="radiogroup"] > label {
+            background: transparent;
+            border-radius: 999px;
+            padding: 6px 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #cbd5f5;
+        }
+        .nav-segment div[role="radiogroup"] > label[data-checked="true"] {
+            background: rgba(56, 189, 248, 0.18);
+            color: #e2e8f0;
+            border: 1px solid rgba(56, 189, 248, 0.5);
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -139,7 +172,7 @@ def render_status_cards(items: List[Dict[str, str]]) -> None:
     st.markdown(f"<div class='dashboard-grid'>{cards}</div>", unsafe_allow_html=True)
 
 def set_nav_tab(tab_name: str) -> None:
-    st.session_state["nav_tab"] = tab_name
+    st.session_state["nav"] = tab_name
 
 def render_header_controls() -> Dict[str, Any]:
     st.title("Trade Analyzer Pro")
@@ -147,69 +180,79 @@ def render_header_controls() -> Dict[str, Any]:
 
     settings = st.session_state.get("settings", {})
     toggles = settings.get("toggles", {})
-    include_stocks = st.toggle(
-        "Include stock trades in P&L calculations",
-        value=bool(toggles.get("include_stocks", False)),
-        help="When enabled, equity trades are included alongside options.",
-        key="include_stocks_toggle",
-    )
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        include_stocks = st.toggle(
+            "Include stock trades in P&L calculations",
+            value=bool(toggles.get("include_stocks", False)),
+            help="When enabled, equity trades are included alongside options.",
+            key="include_stocks_toggle",
+        )
+    with c2:
+        uploaded_files = st.file_uploader(
+            "Upload CSVs (multi-file supported)",
+            type=["csv", "txt"],
+            accept_multiple_files=True,
+        )
     toggles["include_stocks"] = include_stocks
     settings["toggles"] = toggles
     st.session_state["settings"] = settings
 
-    uploaded_files = st.file_uploader("Upload CSVs (multi-file supported)", type=["csv", "txt"], accept_multiple_files=True)
     status_slot = st.empty()
     if st.session_state.get("data_loaded") and st.session_state.get("trust_summary"):
         summary = st.session_state["trust_summary"]
+        parse_time = summary.get("parse_time_s")
+        parse_label = f" • Parsing time: {parse_time:.1f}s" if parse_time is not None else ""
         status_slot.markdown(
             f"**Loaded ✅**  \n"
             f"Files: {summary.get('file_count', 0)} • "
             f"Date range: {summary.get('date_range_label', '—')} • "
             f"Rows parsed: {summary.get('raw_rows', 0):,}"
+            f"{parse_label}"
         )
     return {"uploaded_files": uploaded_files, "include_stocks": include_stocks, "status_slot": status_slot}
 
-def render_trust_badge(trust_summary: Dict[str, Any]) -> None:
+def render_status_pill(trust_summary: Dict[str, Any], location_key: str) -> None:
     status = trust_summary.get("status", st.session_state.get("trust_status", "OK"))
     unmatched_legs = int(trust_summary.get("unmatched_legs", 0))
     open_qty_leftover = int(trust_summary.get("open_qty_leftover", 0))
     status_map = {
-        "OK": ("OK ✅", "status-clean", "Data reconciled; results reliable."),
-        "NEEDS_HISTORY": (
-            "Needs history ⚠️",
-            "status-warn",
+        "OK": ("Data: OK ✅", "pill-ok", "Data reconciled; results reliable."),
+        "PARTIAL": (
+            "Data: Partial ⚠️",
+            "pill-warn",
             (
-                "Missing history detected: "
+                "Missing history: "
                 f"{unmatched_legs} unmatched legs, {open_qty_leftover} open qty leftover. "
                 "Realized P&L for matched closes is valid."
             ),
         ),
-        "ERROR": ("Error ⛔", "status-warn", "Parsing error. Fix column mapping."),
+        "ERROR": ("Data: Error ⛔", "pill-error", "Parsing error. Fix column mapping in Diagnostics."),
     }
     status_label, status_class, message = status_map.get(status, status_map["OK"])
 
-    c1, c2 = st.columns([5, 1])
-    with c1:
+    c1, c2, c3 = st.columns([6, 2, 1])
+    with c2:
         st.markdown(
-            f"<div class='status-card'>"
-            f"<div class='status-label'>Trust status</div>"
-            f"<div class='status-value {status_class}'>{status_label}</div>"
-            f"<div class='stat-sub'>{message}</div>"
-            f"</div>",
+            f"<div style='text-align:right;'><span class='pill {status_class}'>{status_label}</span></div>",
             unsafe_allow_html=True,
         )
-    with c2:
-        if st.button("View details", key=f"trust-details-{st.session_state.get('nav_tab', 'overview')}"):
+    with c3:
+        with st.popover("?", help="Data status details"):
+            st.markdown(message)
+        if st.button("View details", key=f"trust-details-{location_key}"):
             st.session_state["jump_to"] = "diagnostics_recon"
             set_nav_tab("Diagnostics")
 
 def render_overview(data: Dict[str, Any]) -> None:
     st.markdown("### Overview")
-    render_trust_badge(data["trust_summary"])
+    render_status_pill(data["trust_summary"], "overview")
 
     trades_sheet = data["closed_trades_df"]
     if trades_sheet.empty:
-        st.info("No closed trades to display yet.")
+        st.info("No closed trades to display yet. To improve accuracy, upload older statements or review Diagnostics.")
+        if st.button("Open Diagnostics", key="overview-open-diagnostics"):
+            set_nav_tab("Diagnostics")
         return
 
     pnl_total = float(trades_sheet["net_pnl"].sum())
@@ -264,6 +307,21 @@ def render_overview(data: Dict[str, Any]) -> None:
     st.markdown("#### Equity curve + drawdown (realized)")
     st.line_chart(curve.set_index("close_date")[["cum_net", "drawdown"]])
 
+    st.markdown("#### One recommendation you can act on today")
+    if summary_by_type.empty:
+        st.info("Once you have a few closed trades, we'll highlight one priority rule to act on.")
+    else:
+        top_leak = summary_by_type.head(1).to_dict("records")[0]
+        rule_text = LEAK_RULES.get(top_leak["mistake_type"], "Follow your risk rules.")
+        st.markdown(
+            f"<div class='section-card'>"
+            f"<strong>{top_leak['mistake_type']}</strong><br/>"
+            f"<span class='stat-sub'>{rule_text}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.button("View examples", on_click=set_nav_tab, args=("Rules Coach",), key="recommendation-view")
+
     st.markdown("#### Top tickers")
     by_ticker = (trades_sheet.groupby("underlying", as_index=False)
                  .agg(net_pnl=("net_pnl", "sum"))
@@ -303,16 +361,18 @@ def render_overview(data: Dict[str, Any]) -> None:
 
 def render_rules_coach(data: Dict[str, Any]) -> None:
     st.markdown("### Rules Coach")
-    render_trust_badge(data["trust_summary"])
+    render_status_pill(data["trust_summary"], "rules-coach")
     render_rules_coach_overview(data["closed_trades_df"], data["fills_df"])
 
 def render_calendar(data: Dict[str, Any]) -> None:
     st.markdown("### Calendar")
-    render_trust_badge(data["trust_summary"])
+    render_status_pill(data["trust_summary"], "calendar")
 
     daily_pnl = data["daily_pnl_df"]
     if daily_pnl.empty:
-        st.info("No closed trades available to build the daily calendar.")
+        st.info("No closed trades available to build the daily calendar. To improve accuracy, upload older statements or review Diagnostics.")
+        if st.button("Open Diagnostics", key="calendar-open-diagnostics"):
+            set_nav_tab("Diagnostics")
         return
 
     daily_pnl = daily_pnl.copy()
@@ -323,7 +383,25 @@ def render_calendar(data: Dict[str, Any]) -> None:
     month_sel = st.selectbox("Month", options=month_options, index=default_index, key="calendar-month")
     st.session_state["selected_month"] = month_sel
 
-    selected_day = render_pnl_calendar(daily_pnl, month_sel)
+    month_daily = daily_pnl.copy()
+    month_daily["trade_day"] = pd.to_datetime(month_daily["trade_day"], errors="coerce").dt.date
+    year, month = (int(part) for part in month_sel.split("-"))
+    month_daily = month_daily[month_daily["trade_day"].apply(lambda d: pd.notna(d) and d.month == month and d.year == year)]
+
+    month_pnl = float(month_daily["day_pnl"].sum()) if not month_daily.empty else 0.0
+    green_days = int((month_daily["day_pnl"] > 0).sum()) if not month_daily.empty else 0
+    red_days = int((month_daily["day_pnl"] < 0).sum()) if not month_daily.empty else 0
+    trading_days = int(month_daily["trade_day"].nunique()) if not month_daily.empty else 0
+
+    render_stat_cards(
+        [
+            {"label": "Month net P&L", "value": format_currency(month_pnl), "sub": "Realized closes"},
+            {"label": "Green days", "value": f"{green_days:,}", "sub": f"Trading days: {trading_days:,}"},
+            {"label": "Red days", "value": f"{red_days:,}", "sub": "Closed-day results"},
+        ]
+    )
+
+    selected_day = render_pnl_calendar(month_daily, month_sel)
     st.session_state["calendar_selected_day"] = selected_day
 
     if st.button("Clear day filter"):
@@ -331,66 +409,178 @@ def render_calendar(data: Dict[str, Any]) -> None:
         selected_day = None
 
     if selected_day:
-        st.markdown(f"#### Trades closed on {selected_day:%Y-%m-%d}")
+        st.markdown("#### Day Details")
         filtered = apply_day_filter(data["closed_trades_df"], selected_day)
         if filtered.empty:
             st.info("No trades closed on this day.")
-        else:
-            st.dataframe(filtered.sort_values("close_date", ascending=False), use_container_width=True)
+            return
 
-    with st.expander("All closed trades", expanded=False):
-        trades = data["closed_trades_df"]
-        if trades.empty:
-            st.info("No closed trades to display.")
-        else:
-            trades = trades.copy()
-            trades["position_type"] = np.where(trades["sell_date"] < trades["buy_date"], "SHORT", "LONG")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                under_options = sorted(trades["underlying"].unique().tolist())
-                under_sel = st.multiselect(
-                    "Underlying",
-                    options=under_options,
-                    default=st.session_state["filters"].get("underlying", under_options) or under_options,
-                )
-            with c2:
-                right_options = sorted(trades["right"].unique().tolist())
-                right_sel = st.multiselect(
-                    "Type (C/P/Stock)",
-                    options=right_options,
-                    default=st.session_state["filters"].get("right", right_options) or right_options,
-                )
-            with c3:
-                pos_options = sorted(trades["position_type"].unique().tolist())
-                pos_sel = st.multiselect(
-                    "Position (SHORT/LONG)",
-                    options=pos_options,
-                    default=st.session_state["filters"].get("position_type", pos_options) or pos_options,
-                )
+        day_pnl = float(filtered["net_pnl"].sum())
+        trade_count = len(filtered)
+        winners = filtered.sort_values("net_pnl", ascending=False).head(5)
+        losers = filtered.sort_values("net_pnl").head(5)
 
-            st.session_state["filters"] = {
-                "underlying": under_sel,
-                "right": right_sel,
-                "position_type": pos_sel,
-                "date_range": st.session_state["filters"].get("date_range", (None, None)),
-            }
+        s1, s2 = st.columns(2)
+        with s1:
+            st.metric("Day P&L", format_currency(day_pnl))
+        with s2:
+            st.metric("# Trades", f"{trade_count:,}")
 
-            filtered = trades[
-                trades["underlying"].isin(under_sel)
-                & trades["right"].isin(right_sel)
-                & trades["position_type"].isin(pos_sel)
-            ].copy()
-            if filtered.empty:
-                st.warning("No trades match your filters.")
-            else:
-                st.dataframe(
-                    filtered.sort_values("close_date", ascending=False).head(200),
-                    use_container_width=True,
-                )
-                st.caption("Showing top 200 rows. Download full data from Export.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Top 5 winners**")
+            st.dataframe(winners[["underlying", "net_pnl"]], use_container_width=True)
+        with c2:
+            st.markdown("**Top 5 losers**")
+            st.dataframe(losers[["underlying", "net_pnl"]], use_container_width=True)
+
+        st.markdown("**Top 10 trades**")
+        st.dataframe(
+            filtered.sort_values("net_pnl", ascending=False).head(10)[
+                ["close_date", "underlying", "contract_id", "qty", "net_pnl"]
+            ],
+            use_container_width=True,
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Open full trade table (filtered to this day)", key="calendar-open-trades"):
+                st.session_state["trade_day_filter"] = selected_day
+                set_nav_tab("Trades")
+        with b2:
+            day_bytes = filtered.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Export this day",
+                data=day_bytes,
+                file_name=f"trades-{selected_day.isoformat()}.csv",
+                mime="text/csv",
+            )
+
+def render_trades(data: Dict[str, Any]) -> None:
+    st.markdown("### Trades")
+    render_status_pill(data["trust_summary"], "trades")
+
+    trades = data["closed_trades_df"]
+    if trades.empty:
+        st.info("No closed trades to display yet.")
+        return
+
+    trades = trades.copy()
+    trades["position_type"] = np.where(trades["sell_date"] < trades["buy_date"], "SHORT", "LONG")
+    trades["close_date"] = pd.to_datetime(trades["close_date"], errors="coerce")
+    close_dates = trades["close_date"].dropna()
+    min_date = close_dates.min().date() if not close_dates.empty else date.today()
+    max_date = close_dates.max().date() if not close_dates.empty else date.today()
+
+    defaults = {
+        "underlying": sorted(trades["underlying"].dropna().unique().tolist()),
+        "right": sorted(trades["right"].dropna().unique().tolist()),
+        "position_type": sorted(trades["position_type"].dropna().unique().tolist()),
+        "date_range": (min_date, max_date),
+        "search": "",
+    }
+    filters = st.session_state.get("trade_filters", defaults)
+    if not filters.get("date_range") or None in filters.get("date_range", (None, None)):
+        filters = {**filters, "date_range": defaults["date_range"]}
+
+    day_filter = st.session_state.get("trade_day_filter")
+    if day_filter:
+        filters = {
+            **filters,
+            "date_range": (day_filter, day_filter),
+        }
+        st.session_state["trade_day_filter"] = None
+
+    with st.expander("Filters", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            under_sel = st.multiselect(
+                "Underlying",
+                options=defaults["underlying"],
+                default=filters.get("underlying", defaults["underlying"]) or defaults["underlying"],
+            )
+        with c2:
+            right_sel = st.multiselect(
+                "Type (C/P/Stock)",
+                options=defaults["right"],
+                default=filters.get("right", defaults["right"]) or defaults["right"],
+            )
+        with c3:
+            pos_sel = st.multiselect(
+                "Position (SHORT/LONG)",
+                options=defaults["position_type"],
+                default=filters.get("position_type", defaults["position_type"]) or defaults["position_type"],
+            )
+        c4, c5 = st.columns(2)
+        with c4:
+            date_range = st.date_input("Close date range", filters.get("date_range", defaults["date_range"]))
+        with c5:
+            search = st.text_input("Search (contract_id / underlying)", value=filters.get("search", ""))
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        date_range = date_range
+    else:
+        date_range = defaults["date_range"]
+
+    filters = {
+        "underlying": under_sel,
+        "right": right_sel,
+        "position_type": pos_sel,
+        "date_range": date_range,
+        "search": search,
+    }
+    st.session_state["trade_filters"] = filters
+
+    summary_bits = []
+    if under_sel != defaults["underlying"]:
+        summary_bits.append(f"Underlying={','.join(under_sel)}")
+    if right_sel != defaults["right"]:
+        summary_bits.append(f"Type={','.join(right_sel)}")
+    if pos_sel != defaults["position_type"]:
+        summary_bits.append(f"Position={','.join(pos_sel)}")
+    if date_range != defaults["date_range"]:
+        summary_bits.append(f"Date={date_range[0]}→{date_range[1]}")
+    if search:
+        summary_bits.append(f"Search={search}")
+
+    summary_line = "Filters: " + " | ".join(summary_bits) if summary_bits else "Filters: None"
+    s1, s2 = st.columns([5, 1])
+    with s1:
+        st.caption(summary_line)
+    with s2:
+        if st.button("Clear all"):
+            st.session_state["trade_filters"] = defaults
+            st.experimental_rerun()
+
+    filtered = trades[
+        trades["underlying"].isin(under_sel)
+        & trades["right"].isin(right_sel)
+        & trades["position_type"].isin(pos_sel)
+    ].copy()
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start, end = date_range
+        filtered = filtered[
+            (filtered["close_date"].dt.date >= start)
+            & (filtered["close_date"].dt.date <= end)
+        ]
+    if search:
+        query = search.lower()
+        filtered = filtered[
+            filtered["contract_id"].astype(str).str.lower().str.contains(query)
+            | filtered["underlying"].astype(str).str.lower().str.contains(query)
+        ]
+
+    if filtered.empty:
+        st.info("No trades match your filters.")
+        return
+
+    st.dataframe(filtered.sort_values("close_date", ascending=False).head(200), use_container_width=True)
+    st.caption("Showing top 200 rows. Download full data from Export.")
 
 def render_diagnostics(data: Dict[str, Any]) -> None:
-    st.markdown("### Reconciliation & Data Quality")
+    st.markdown("### Diagnostics")
+    render_status_pill(data["trust_summary"], "diagnostics")
+    st.markdown("#### Reconciliation & Data Quality")
     st.markdown("<div id='diagnostics_recon'></div>", unsafe_allow_html=True)
     if st.session_state.get("jump_to") == "diagnostics_recon":
         st.session_state["jump_to"] = None
@@ -460,12 +650,9 @@ def render_diagnostics(data: Dict[str, Any]) -> None:
         ]
     )
 
-    if data["has_issues"]:
-        st.warning(f"{data['status_icon']} Issues detected — review before trusting results.")
-
     issue_df = data["issues_samples_df"]
     summary_table = data["issues_summary_df"]
-    with st.expander("View issues", expanded=data["has_issues"]):
+    with st.expander("Issues detected", expanded=False):
         if summary_table.empty:
             st.success("No reconciliation issues detected.")
         else:
@@ -646,6 +833,7 @@ def render_diagnostics(data: Dict[str, Any]) -> None:
 
 def render_export(data: Dict[str, Any]) -> None:
     st.markdown("### Export")
+    render_status_pill(data["trust_summary"], "export")
     st.caption("Download normalized data and analysis outputs.")
 
     def csv_bytes(df: pd.DataFrame) -> bytes:
@@ -679,11 +867,18 @@ def render_export(data: Dict[str, Any]) -> None:
             mime="text/csv",
             disabled=data["sim_outputs"]["overrides_df"].empty,
         )
+    st.download_button(
+        "Download diagnostics issues",
+        data=csv_bytes(data["issues_samples_df"]),
+        file_name="diagnostics_issues.csv",
+        mime="text/csv",
+        disabled=data["issues_samples_df"].empty,
+    )
 
     if data["daily_pnl_df"].empty:
         st.info("Need closed trades to generate a shareable month summary.")
     else:
-        st.markdown("### Share my month (PNG)")
+        st.markdown("### Shareable summary")
         daily_pnl = data["daily_pnl_df"].copy()
         daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
         month_options = sorted(daily_pnl["month"].unique().tolist())
@@ -693,17 +888,23 @@ def render_export(data: Dict[str, Any]) -> None:
         by_ticker = (data["closed_trades_df"].groupby("underlying", as_index=False)
                      .agg(net_pnl=("net_pnl", "sum"))
                      .sort_values("net_pnl", ascending=False))
+        closed_trades = data["closed_trades_df"]
+        wins = closed_trades[closed_trades["net_pnl"] > 0]["net_pnl"]
+        losses = closed_trades[closed_trades["net_pnl"] < 0]["net_pnl"]
+        profit_factor = wins.sum() / abs(losses.sum()) if not losses.empty else np.inf
         summary_payload = {
-            "realized_pnl": float(data["closed_trades_df"]["net_pnl"].sum()) if not data["closed_trades_df"].empty else 0.0,
-            "max_drawdown": abs(float(data["closed_trades_df"].sort_values("close_date")["net_pnl"].cumsum().sub(
-                data["closed_trades_df"].sort_values("close_date")["net_pnl"].cumsum().cummax()).min()))
-            if not data["closed_trades_df"].empty else 0.0,
+            "realized_pnl": float(closed_trades["net_pnl"].sum()) if not closed_trades.empty else 0.0,
+            "win_rate": float((closed_trades["net_pnl"] > 0).mean()) if not closed_trades.empty else 0.0,
+            "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else None,
+            "max_drawdown": abs(float(closed_trades.sort_values("close_date")["net_pnl"].cumsum().sub(
+                closed_trades.sort_values("close_date")["net_pnl"].cumsum().cummax()).min()))
+            if not closed_trades.empty else 0.0,
             "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
             "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
         }
         png_bytes = build_share_image(daily_pnl[daily_pnl["month"] == month_sel], month_sel, summary_payload, top_leaks)
         st.download_button(
-            "Download shareable PNG",
+            "Generate share card (PNG)",
             data=png_bytes,
             file_name=f"trade-summary-{month_sel}.png",
             mime="image/png",
@@ -714,10 +915,10 @@ def render_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     updated = dict(settings)
     c1, c2, c3 = st.columns(3)
     with c1:
-        updated["account_size"] = st.number_input(
+        updated["account_size_usd"] = st.number_input(
             "Account size ($)",
             min_value=0.0,
-            value=float(updated.get("account_size", 100000.0)),
+            value=float(updated.get("account_size_usd", 100000.0)),
             step=1000.0,
         )
     with c2:
@@ -901,7 +1102,7 @@ def log_event(event_name: str, user_id: Optional[int] = None, details: Optional[
     conn.close()
 
 def navigate_to_diagnostics(mistake_type: str) -> None:
-    st.session_state["nav_tab"] = "Diagnostics"
+    st.session_state["nav"] = "Diagnostics"
     st.session_state["diagnostics_mistake_type"] = mistake_type
 
 APP_PASS = os.getenv("APP_PASS", "")
@@ -923,14 +1124,19 @@ if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
 if "user" not in st.session_state:
     st.session_state["user"] = None
-if "nav_tab" not in st.session_state:
-    st.session_state["nav_tab"] = "Overview"
+if "nav" not in st.session_state:
+    st.session_state["nav"] = "Overview"
 st.session_state.setdefault("data_loaded", False)
 st.session_state.setdefault("trust_status", "OK")
 st.session_state.setdefault("trust_summary", {})
 st.session_state.setdefault("selected_month", datetime.today().strftime("%Y-%m"))
 st.session_state.setdefault("calendar_selected_day", None)
+st.session_state.setdefault("trade_day_filter", None)
 st.session_state.setdefault("rules_selected_rule", None)
+st.session_state.setdefault(
+    "trade_filters",
+    {"underlying": [], "right": [], "position_type": [], "date_range": (None, None), "search": ""},
+)
 st.session_state.setdefault(
     "filters",
     {"underlying": [], "right": [], "position_type": [], "date_range": (None, None)},
@@ -938,7 +1144,7 @@ st.session_state.setdefault(
 st.session_state.setdefault(
     "settings",
     {
-        "account_size": 100000.0,
+        "account_size_usd": 100000.0,
         "max_loss_pct": 1.0,
         "red_day_pct": 2.0,
         "toggles": {"realized_only": True, "include_stocks": False},
@@ -1040,6 +1246,10 @@ def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
         except Exception:
             df = _read_flexible(cleaned, ",")
         return df
+
+@st.cache_data(show_spinner=False)
+def load_csv_cached(file_bytes: bytes) -> pd.DataFrame:
+    return load_csv_bytes(file_bytes)
 
 # -------------------------
 # Option parsing
@@ -1406,6 +1616,7 @@ def detect_mistakes(closed_trades: pd.DataFrame, fills: Optional[pd.DataFrame]) 
 # -------------------------
 # Daily P&L calendar helpers
 # -------------------------
+@st.cache_data(show_spinner=False)
 def compute_daily_pnl(closed_trades: pd.DataFrame) -> pd.DataFrame:
     if closed_trades.empty:
         return pd.DataFrame(columns=["trade_day", "day_pnl", "trade_count", "win_count", "loss_count"])
@@ -1423,6 +1634,7 @@ def compute_daily_pnl(closed_trades: pd.DataFrame) -> pd.DataFrame:
                   loss_count=("net_pnl", lambda s: int((s < 0).sum()))))
     return daily
 
+@st.cache_data(show_spinner=False)
 def compute_equity_curve(closed_trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     if closed_trades.empty:
         empty = pd.DataFrame(columns=["trade_day", "daily_pnl", "cum_pnl", "peak", "drawdown"])
@@ -1767,18 +1979,19 @@ def render_rules_coach_overview(
 
     prepared = _prepare_closed_trades(closed_trades)
     defaults = _compute_rule_defaults(prepared)
+    settings = st.session_state.get("settings", {})
+    account_size = float(settings.get("account_size_usd", 0.0) or 0.0)
+    max_loss_pct = float(settings.get("max_loss_pct", 0.0) or 0.0)
+    max_loss = (account_size * max_loss_pct / 100.0) if account_size > 0 and max_loss_pct > 0 else defaults["max_loss"]
+    st.session_state["rules_max_loss"] = max_loss
 
     c1, c2 = st.columns(2)
     with c1:
-        max_loss = st.number_input(
-            "MAX_LOSS ($)",
-            min_value=0.0,
-            value=float(st.session_state.get("rules_max_loss", defaults["max_loss"])),
-            step=10.0,
-            help="Rule 2 cap for worst per-trade loss.",
-            key="rules_max_loss_overview",
-        )
-        st.session_state["rules_max_loss"] = max_loss
+        st.metric("Max loss cap", format_currency(max_loss))
+        if account_size <= 0 or max_loss_pct <= 0:
+            st.caption("Set account size in Settings to enable % caps.")
+        else:
+            st.caption(f"Cap maximum loss per trade to {max_loss_pct:.2f}% of account.")
     with c2:
         red_day_limit = st.number_input(
             "RED_DAY_LIMIT ($)",
@@ -1874,8 +2087,13 @@ def render_rules_coach_overview(
                 )
                 if summary.get("message"):
                     st.caption(summary["message"])
+                if key == "rule2":
+                    if account_size > 0 and max_loss_pct > 0:
+                        st.caption(f"Cap maximum loss per trade to {max_loss_pct:.2f}% of account.")
+                    else:
+                        st.caption("Set account size in Settings to enable % caps.")
 
-            if st.button("View affected trades", key=f"view-affected-{key}"):
+            if st.button("Show affected trades", key=f"view-affected-{key}"):
                 st.session_state["rules_coach_selected_rules"] = [summary.get("name", key)]
                 st.session_state["rules_coach_show_affected"] = True
                 st.session_state["rules_selected_rule"] = summary.get("name", key)
@@ -2074,40 +2292,11 @@ def apply_day_filter(closed_trades: pd.DataFrame, selected_day: Optional[date]) 
 
 def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optional[date]:
     if daily_pnl_df.empty:
-        st.info("No daily P&L data available for the calendar.")
+        st.info("No realized closes in this month yet.")
         return st.session_state.get("calendar_selected_day")
 
     year, month = (int(part) for part in month_yyyy_mm.split("-"))
     month_df = daily_pnl_df.copy()
-    month_df["trade_day"] = pd.to_datetime(month_df["trade_day"], errors="coerce").dt.date
-    month_df = month_df[month_df["trade_day"].apply(lambda d: pd.notna(d) and d.month == month and d.year == year)]
-
-    month_pnl = float(month_df["day_pnl"].sum()) if not month_df.empty else 0.0
-    green_days = int((month_df["day_pnl"] > 0).sum()) if not month_df.empty else 0
-    red_days = int((month_df["day_pnl"] < 0).sum()) if not month_df.empty else 0
-    trading_days = int(month_df["trade_day"].nunique()) if not month_df.empty else 0
-    avg_day_pnl = (month_pnl / trading_days) if trading_days else 0.0
-
-    render_stat_cards(
-        [
-            {
-                "label": "Month net P&L",
-                "value": format_currency(month_pnl),
-                "sub": f"Avg per trading day: {format_currency(avg_day_pnl)}",
-            },
-            {
-                "label": "Green days",
-                "value": f"{green_days:,}",
-                "sub": f"Trading days: {trading_days:,}",
-            },
-            {
-                "label": "Red days",
-                "value": f"{red_days:,}",
-                "sub": "Closed-day results",
-            },
-        ]
-    )
-
     abs_max = float(month_df["day_pnl"].abs().max()) if not month_df.empty else 0.0
     first_weekday, num_days = calendar.monthrange(year, month)
 
@@ -2388,6 +2577,14 @@ def normalize_ibkr(df: pd.DataFrame, mapping: Dict[str, str], include_stocks: bo
     )
     return w.sort_values("trade_dt").reset_index(drop=True)
 
+@st.cache_data(show_spinner=False)
+def normalize_fidelity_cached(df: pd.DataFrame, include_stocks: bool) -> pd.DataFrame:
+    return normalize_fidelity(df, include_stocks)
+
+@st.cache_data(show_spinner=False)
+def normalize_ibkr_cached(df: pd.DataFrame, mapping: Dict[str, str], include_stocks: bool) -> pd.DataFrame:
+    return normalize_ibkr(df, mapping, include_stocks)
+
 def build_dedupe_key(df: pd.DataFrame) -> pd.Series:
     expiry = pd.to_datetime(df["expiry"], errors="coerce").dt.date.astype(str)
     strike = pd.to_numeric(df["strike"], errors="coerce").round(4).astype(str)
@@ -2465,6 +2662,10 @@ def build_share_image(
     ax.text(0.02, 0.95, f"Trade Month Summary — {month_str}", fontsize=16, fontweight="bold", color="#f8fafc")
     ax.text(0.02, 0.90, f"Realized P&L: ${summary['realized_pnl']:,.2f}", fontsize=12, color="#38bdf8")
     ax.text(0.35, 0.90, f"Max drawdown: ${summary['max_drawdown']:,.2f}", fontsize=12, color="#f87171")
+    ax.text(0.02, 0.86, f"Win rate: {summary.get('win_rate', 0.0) * 100:.1f}%", fontsize=11, color="#e2e8f0")
+    profit_factor = summary.get("profit_factor")
+    pf_label = f"{profit_factor:,.2f}" if profit_factor is not None else "—"
+    ax.text(0.35, 0.86, f"Profit factor: {pf_label}", fontsize=11, color="#e2e8f0")
 
     for idx, leak in enumerate(top_leaks[:3]):
         ax.text(
@@ -2528,13 +2729,16 @@ if not uploaded_files:
 
 log_event("file_uploaded", details={"file_count": len(uploaded_files)}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
 
+status = st.status("Parsing files...", expanded=False)
+parse_start = time.perf_counter()
+
 file_entries = []
 raw_rows = 0
 fee_columns: List[str] = []
 file_errors = []
 for idx, up in enumerate(uploaded_files):
     try:
-        df = load_csv_bytes(up.getvalue())
+        df = load_csv_cached(up.getvalue())
     except Exception as e:
         file_errors.append(f"{up.name}: {e}")
         continue
@@ -2543,6 +2747,7 @@ for idx, up in enumerate(uploaded_files):
     file_entries.append({"file": up, "df": df, "detected": detected, "broker": detected, "index": idx})
 
 if file_errors:
+    parse_elapsed = time.perf_counter() - parse_start
     st.session_state["trust_status"] = "ERROR"
     st.session_state["trust_summary"] = {
         "status": "ERROR",
@@ -2551,7 +2756,9 @@ if file_errors:
         "date_range_label": "—",
         "unmatched_legs": 0,
         "open_qty_leftover": 0,
+        "parse_time_s": parse_elapsed,
     }
+    status.update(label="Parsing failed", state="error")
     st.error("Some files could not be parsed:\n" + "\n".join(file_errors))
     log_event("error", details={"errors": file_errors}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
     st.stop()
@@ -2596,12 +2803,12 @@ for entry in file_entries:
     entry["mapping"] = mapping
 
     if broker == "Fidelity":
-        normalized = normalize_fidelity(entry["df"], include_stocks)
+        normalized = normalize_fidelity_cached(entry["df"], include_stocks)
         fee_columns.extend([col for col in ["Commission", "Fees"] if col in entry["df"].columns])
     elif broker == "IBKR":
         if mapping is None:
             continue
-        normalized = normalize_ibkr(entry["df"], mapping, include_stocks)
+        normalized = normalize_ibkr_cached(entry["df"], mapping, include_stocks)
         if mapping.get("fees"):
             fee_columns.append(mapping["fees"])
     else:
@@ -2611,10 +2818,13 @@ for entry in file_entries:
 
 if not normalized_frames:
     st.session_state["trust_status"] = "ERROR"
+    status.update(label="Parsing failed", state="error")
     st.warning("No trades parsed from these files.")
     st.stop()
 
 work = pd.concat(normalized_frames, ignore_index=True)
+parse_elapsed = time.perf_counter() - parse_start
+status.update(label="Reconciling legs...", state="running")
 work["dedupe_key"] = build_dedupe_key(work)
 duplicate_count = int(work.duplicated("dedupe_key").sum())
 dup_rows = work[work.duplicated("dedupe_key", keep="first")].copy()
@@ -2645,6 +2855,8 @@ for cid, g in work.groupby("contract_id", sort=False):
 
 closed = pd.concat(closed_all, ignore_index=True) if closed_all else pd.DataFrame()
 openpos = pd.concat(open_all, ignore_index=True) if open_all else pd.DataFrame()
+
+status.update(label="Computing P&L...", state="running")
 
 trades_sheet = closed.copy().reset_index(drop=True) if not closed.empty else pd.DataFrame()
 if not trades_sheet.empty:
@@ -2700,7 +2912,7 @@ if not openpos.empty:
 has_issues = duplicate_count > 0 or recon["unmatched_legs"] > 0 or recon["open_qty"] > 0
 parse_error = any(entry["broker"] == "Unknown" for entry in file_entries)
 needs_history = recon["unmatched_legs"] > 0 or recon["open_qty"] > 0
-trust_status = "ERROR" if parse_error else "NEEDS_HISTORY" if needs_history else "OK"
+trust_status = "ERROR" if parse_error else "PARTIAL" if needs_history else "OK"
 st.session_state["trust_status"] = trust_status
 trust_summary = {
     "status": trust_status,
@@ -2709,6 +2921,7 @@ trust_summary = {
     "date_range_label": date_range_label,
     "unmatched_legs": recon["unmatched_legs"],
     "open_qty_leftover": recon["open_qty"],
+    "parse_time_s": parse_elapsed,
 }
 st.session_state["trust_summary"] = trust_summary
 st.session_state["data_loaded"] = True
@@ -2716,7 +2929,8 @@ header_controls["status_slot"].markdown(
     f"**Loaded ✅**  \n"
     f"Files: {trust_summary['file_count']} • "
     f"Date range: {trust_summary['date_range_label']} • "
-    f"Rows parsed: {trust_summary['raw_rows']:,}"
+    f"Rows parsed: {trust_summary['raw_rows']:,} • "
+    f"Parsing time: {trust_summary['parse_time_s']:.1f}s"
 )
 
 issue_df = pd.DataFrame(issues)
@@ -2754,33 +2968,37 @@ mark_data_available = False
 
 equity_curve_df = pd.DataFrame()
 if not trades_sheet.empty:
-    curve = trades_sheet.sort_values("close_date")[["close_date", "net_pnl"]].copy()
-    curve["cum_net"] = curve["net_pnl"].cumsum()
-    curve["peak"] = curve["cum_net"].cummax()
-    curve["drawdown"] = curve["cum_net"] - curve["peak"]
-    equity_curve_df = curve
+    equity_curve_df, _ = compute_equity_curve(trades_sheet)
 
 sim_outputs = {"overrides_df": pd.DataFrame()}
 if not trades_sheet.empty:
     prepared = _prepare_closed_trades(trades_sheet)
     defaults = _compute_rule_defaults(prepared)
-    max_loss = float(st.session_state.get("rules_max_loss", defaults["max_loss"]))
+    settings = st.session_state.get("settings", {})
+    account_size = float(settings.get("account_size_usd", 0.0) or 0.0)
+    max_loss_pct = float(settings.get("max_loss_pct", 0.0) or 0.0)
+    max_loss = (account_size * max_loss_pct / 100.0) if account_size > 0 and max_loss_pct > 0 else defaults["max_loss"]
+    st.session_state["rules_max_loss"] = max_loss
     red_day_limit = float(st.session_state.get("rules_red_day_limit", defaults["red_day_limit"]))
     _, overrides_df, _, _ = simulate_rules(prepared, work, params={"max_loss": max_loss, "red_day_limit": red_day_limit})
     sim_outputs["overrides_df"] = overrides_df
 
-nav_tabs = ["Overview", "Rules Coach", "Calendar", "Diagnostics", "Export", "Settings"]
-if st.session_state.get("nav_tab") not in nav_tabs:
-    st.session_state["nav_tab"] = "Overview"
-nav_index = nav_tabs.index(st.session_state.get("nav_tab", "Overview"))
+status.update(label="Analysis ready", state="complete")
+
+nav_tabs = ["Overview", "Rules Coach", "Calendar", "Trades", "Diagnostics", "Export", "Settings"]
+if st.session_state.get("nav") not in nav_tabs:
+    st.session_state["nav"] = "Overview"
+nav_index = nav_tabs.index(st.session_state.get("nav", "Overview"))
+st.markdown("<div class='nav-segment'>", unsafe_allow_html=True)
 nav_selection = st.radio(
     "Navigation",
     nav_tabs,
     index=nav_index,
     horizontal=True,
-    key="nav_tab",
+    key="nav",
     label_visibility="collapsed",
 )
+st.markdown("</div>", unsafe_allow_html=True)
 if st.session_state.get("last_nav") != nav_selection:
     st.session_state["last_nav"] = nav_selection
     log_event("page_view", details={"tab": nav_selection}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
@@ -2811,6 +3029,8 @@ elif nav_selection == "Rules Coach":
     render_rules_coach(data)
 elif nav_selection == "Calendar":
     render_calendar(data)
+elif nav_selection == "Trades":
+    render_trades(data)
 elif nav_selection == "Diagnostics":
     render_diagnostics(data)
 elif nav_selection == "Export":
