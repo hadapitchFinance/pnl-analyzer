@@ -277,6 +277,10 @@ def log_event(event_name: str, user_id: Optional[int] = None, details: Optional[
     conn.commit()
     conn.close()
 
+def navigate_to_diagnostics(mistake_type: str) -> None:
+    st.session_state["nav_tab"] = "Diagnostics"
+    st.session_state["diagnostics_mistake_type"] = mistake_type
+
 APP_PASS = os.getenv("APP_PASS", "")
 
 if APP_PASS:
@@ -1560,10 +1564,12 @@ if nav_selection == "Overview":
                         f"Damage: ${leak['total_damage']:,.2f} • Count: {int(leak['count'])}  \n"
                         f"_Rule_: {rule_text}",
                     )
-                    if st.button("Show examples", key=f"leak-{leak['mistake_type']}"):
-                        st.session_state["nav_tab"] = "Diagnostics"
-                        st.session_state["diagnostics_mistake_type"] = leak["mistake_type"]
-                        st.experimental_rerun()
+                    st.button(
+                        "Show examples",
+                        key=f"leak-{leak['mistake_type']}",
+                        on_click=navigate_to_diagnostics,
+                        args=(leak["mistake_type"],),
+                    )
 
         st.markdown("#### Daily P&L calendar (realized)")
         if daily_pnl.empty:
