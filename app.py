@@ -8,7 +8,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -137,6 +137,18 @@ def render_status_cards(items: List[Dict[str, str]]) -> None:
         ]
     )
     st.markdown(f"<div class='dashboard-grid'>{cards}</div>", unsafe_allow_html=True)
+
+def format_currency(value: float) -> str:
+    return f"${value:,.2f}"
+
+def format_percent(value: float) -> str:
+    return f"{value:,.1f}%"
+
+def format_drawdown(value: float) -> str:
+    abs_value = abs(float(value))
+    if abs_value < 1:
+        return "<$1"
+    return f"${abs_value:,.2f}"
 
 def get_db_conn() -> sqlite3.Connection:
     db_path = os.getenv("APP_DB_PATH", "app.db")
@@ -904,6 +916,15 @@ def simulate_rules(
     rule_summaries: Dict[str, Dict[str, object]] = {}
     params = params or {}
 
+    def _cost_and_savings(affected_df: pd.DataFrame) -> Tuple[float, float]:
+        if affected_df.empty:
+            return 0.0, 0.0
+        baseline_vals = pd.to_numeric(affected_df["baseline_net_pnl"], errors="coerce").fillna(0.0)
+        sim_vals = pd.to_numeric(affected_df["sim_net_pnl"], errors="coerce").fillna(0.0)
+        cost = -float(np.minimum(0, baseline_vals).sum())
+        savings = float((sim_vals - baseline_vals).sum())
+        return cost, savings
+
     # Rule 1: No Averaging Down
     rule1_name = "Rule 1 — No Averaging Down"
     if fills is None or fills.empty:
@@ -961,15 +982,15 @@ def simulate_rules(
         affected = base[base["contract_key"].isin(violating_contracts)].copy()
         if not affected.empty:
             affected["override_reason"] = "Scaled by entry units (approximation)"
-        baseline_cost = float(affected["baseline_net_pnl"].sum()) if not affected.empty else 0.0
-        simulated_cost = float(affected["sim_net_pnl"].sum()) if not affected.empty else 0.0
+        baseline_cost, simulated_savings = _cost_and_savings(affected)
+        violation_count = int(sum(add_counts.get(ck, 0) for ck in violating_contracts))
         rule_summaries["rule1"] = {
             "name": rule1_name,
             "status": "active",
             "message": "Approximation by scaling to remove adds.",
-            "violations": len(violating_contracts),
+            "violations": violation_count,
             "baseline_cost": baseline_cost,
-            "simulated_savings": baseline_cost - simulated_cost,
+            "simulated_savings": simulated_savings,
             "affected_trades": affected,
         }
 
@@ -1006,18 +1027,17 @@ def simulate_rules(
                     "override_reason": f"Clamped to -${max_loss:,.2f}",
                 })
 
-        baseline_cost = float(violating["baseline_net_pnl"].sum()) if not violating.empty else 0.0
-        simulated_cost = float(base.loc[violating.index, "sim_net_pnl"].sum()) if not violating.empty else 0.0
         affected = base.loc[violating.index].copy()
         if not affected.empty:
             affected["override_reason"] = f"Clamped to -${max_loss:,.2f}"
+        baseline_cost, simulated_savings = _cost_and_savings(affected)
         rule_summaries["rule2"] = {
             "name": rule2_name,
             "status": "active",
             "message": f"Cap applied at -${max_loss:,.2f}.",
             "violations": len(violating),
             "baseline_cost": baseline_cost,
-            "simulated_savings": baseline_cost - simulated_cost,
+            "simulated_savings": simulated_savings,
             "affected_trades": affected,
             "max_loss": max_loss,
         }
@@ -1068,18 +1088,17 @@ def simulate_rules(
                     "override_reason": "Skipped after red-day limit hit",
                 })
 
-        baseline_cost = float(skipped["baseline_net_pnl"].sum()) if not skipped.empty else 0.0
-        simulated_cost = float(base.loc[skipped.index, "sim_net_pnl"].sum()) if not skipped.empty else 0.0
         affected = base.loc[skipped.index].copy()
         if not affected.empty:
             affected["override_reason"] = "Skipped after red-day limit hit"
+        baseline_cost, simulated_savings = _cost_and_savings(affected)
         rule_summaries["rule3"] = {
             "name": rule3_name,
             "status": "active",
             "message": f"Limit applied at -${red_day_limit:,.2f} per day.",
-            "violations": len(skipped),
+            "violations": len(trigger_days),
             "baseline_cost": baseline_cost,
-            "simulated_savings": baseline_cost - simulated_cost,
+            "simulated_savings": simulated_savings,
             "affected_trades": affected,
             "red_day_limit": red_day_limit,
             "trigger_days": trigger_days,
@@ -1154,21 +1173,47 @@ def render_rules_coach_overview(
     sim_dd = sim_metrics["max_drawdown"]
     dd_delta = base_dd - sim_dd
 
+    rule_summaries = sim_metrics.get("rule_summaries", {})
+    rule1_summary = rule_summaries.get("rule1", {})
+    has_closed = not sim_trades.empty
+    if not has_closed:
+        quality_label = "UNAVAILABLE ⛔"
+    elif rule1_summary.get("status") == "active" and rule1_summary.get("violations", 0) > 0:
+        quality_label = "APPROX ⚠️"
+    else:
+        quality_label = "EXACT ✅"
+
+    badge_html = f"<span class='pill'>Simulation quality: {quality_label}</span>"
+    badge_col, popover_col = st.columns([4, 1])
+    with badge_col:
+        st.markdown(badge_html, unsafe_allow_html=True)
+    with popover_col:
+        with st.popover("ℹ️"):
+            st.markdown(
+                "- Deterministic what-if based only on your realized trades. No market data used.\n"
+                "- Rule 1 uses proportional scaling to approximate ‘no averaging down’ because per-unit P&L is not available."
+            )
+
     render_stat_cards(
         [
-            {"label": "Baseline realized P&L", "value": f"${baseline_pnl:,.2f}", "sub": "Closed trades only"},
-            {"label": "Simulated realized P&L", "value": f"${sim_pnl:,.2f}", "sub": "After 3 rules"},
-            {"label": "Delta", "value": f"${pnl_delta:,.2f}", "sub": "Improvement"},
-            {"label": "Baseline max drawdown", "value": f"${base_dd:,.2f}", "sub": "Realized equity"},
-            {"label": "Simulated max drawdown", "value": f"${sim_dd:,.2f}", "sub": "Rules applied"},
-            {"label": "Drawdown reduction", "value": f"${dd_delta:,.2f}", "sub": "Improvement"},
+            {"label": "Baseline realized P&L", "value": format_currency(baseline_pnl), "sub": "Closed trades only"},
+            {"label": "Simulated realized P&L", "value": format_currency(sim_pnl), "sub": "After 3 rules"},
+            {"label": "Delta", "value": format_currency(pnl_delta), "sub": "Improvement"},
+            {"label": "Baseline max drawdown", "value": format_currency(base_dd), "sub": "Realized equity"},
+            {"label": "Simulated max drawdown", "value": format_drawdown(sim_dd), "sub": "Rules applied"},
+            {"label": "Drawdown reduction", "value": format_currency(dd_delta), "sub": "Improvement"},
         ]
     )
 
-    st.caption("Simulations are deterministic approximations based on your realized trades; no market data is used.")
-    st.caption("Rule 1 uses a scaling approximation when removing adds because per-unit P&L is unavailable.")
+    st.markdown(
+        f"**Check:** baseline P&L ({format_currency(baseline_pnl)}) + delta ({format_currency(pnl_delta)}) = "
+        f"simulated P&L ({format_currency(sim_pnl)})"
+    )
+    gate_ok = abs((baseline_pnl + pnl_delta) - sim_pnl) <= 0.01
+    if not gate_ok:
+        st.error("Simulator reconciliation mismatch detected. Please review inputs before using rule outputs.")
+        return
 
-    rule_summaries = sim_metrics.get("rule_summaries", {})
     st.markdown("#### Rule cards")
     rule_cols = st.columns(3)
     for col, key in zip(rule_cols, ["rule1", "rule2", "rule3"]):
@@ -1178,40 +1223,132 @@ def render_rules_coach_overview(
             if summary.get("status") == "unavailable":
                 st.warning(summary.get("message", "Rule unavailable."))
             else:
-                st.markdown(f"Violations: **{summary.get('violations', 0)}**")
-                st.markdown(f"Cost: **${summary.get('baseline_cost', 0.0):,.2f}**")
-                st.markdown(f"Simulated savings: **${summary.get('simulated_savings', 0.0):,.2f}**")
+                st.metric(
+                    "Violations",
+                    f"{int(summary.get('violations', 0)):,}",
+                    help=(
+                        "Rule 1: count of ADD events (position size increases). "
+                        "Rule 2: count of trades with net_pnl < -MAX_LOSS. "
+                        "Rule 3: count of trigger days. Fix: tighten the rule or reduce position size."
+                    ),
+                )
+                st.metric(
+                    "Cost",
+                    format_currency(float(summary.get("baseline_cost", 0.0))),
+                    help="Cost = -sum(min(0, baseline_net_pnl)) over affected trades. Fix: avoid these scenarios.",
+                )
+                st.metric(
+                    "Simulated savings",
+                    format_currency(float(summary.get("simulated_savings", 0.0))),
+                    help="Savings = sum(sim_net_pnl - baseline_net_pnl) over affected trades. Fix: apply this rule.",
+                )
                 if summary.get("message"):
                     st.caption(summary["message"])
 
             if st.button("View affected trades", key=f"view-affected-{key}"):
-                st.session_state["rules_coach_selected_rule"] = key
+                st.session_state["rules_coach_selected_rules"] = [summary.get("name", key)]
+                st.session_state["rules_coach_show_affected"] = True
 
-    selected_rule = st.session_state.get("rules_coach_selected_rule")
-    if selected_rule and rule_summaries.get(selected_rule):
-        summary = rule_summaries[selected_rule]
-        affected = summary.get("affected_trades", pd.DataFrame()).copy()
-        if affected.empty:
-            st.info("No affected trades for this rule.")
-        else:
-            affected = affected.assign(
-                simulated_net_pnl=affected["sim_net_pnl"],
-                delta=affected["sim_net_pnl"] - affected["baseline_net_pnl"],
+    rule_order = [
+        rule_summaries.get("rule1", {}).get("name", "Rule 1 — No Averaging Down"),
+        rule_summaries.get("rule2", {}).get("name", "Rule 2 — Max Loss Per Trade Cap"),
+        rule_summaries.get("rule3", {}).get("name", "Rule 3 — Stop Trading After Red Day Limit"),
+    ]
+    sim_trades = sim_trades.copy()
+    sim_trades["simulated_net_pnl"] = sim_trades["sim_net_pnl"]
+    sim_trades["delta"] = sim_trades["simulated_net_pnl"] - sim_trades["baseline_net_pnl"]
+    max_loss_value = rule_summaries.get("rule2", {}).get("max_loss", max_loss)
+
+    def _why_changed(rules: List[str]) -> str:
+        reasons = []
+        if rule_order[0] in rules:
+            reasons.append("Scaled down units (Rule 1 approx)")
+        if rule_order[1] in rules:
+            reasons.append(f"Loss capped at -{format_currency(max_loss_value)}")
+        if rule_order[2] in rules:
+            reasons.append("Skipped after red-day limit hit")
+        return ", ".join(reasons) if reasons else "—"
+
+    sim_trades["why_changed"] = sim_trades["rules_applied"].apply(_why_changed)
+    sim_trades["rules_applied_label"] = sim_trades["rules_applied"].apply(
+        lambda rules: ", ".join(rules) if rules else "—"
+    )
+
+    show_affected = st.session_state.get("rules_coach_show_affected", False)
+    with st.expander("Affected trades (audit trail)", expanded=show_affected):
+        st.markdown("<a id='affected-trades'></a>", unsafe_allow_html=True)
+        if sim_trades.empty:
+            st.info("No trades available for the affected trades audit.")
+            return
+
+        rule_options = [name for name in rule_order if name]
+        default_rules = st.session_state.get("rules_coach_selected_rules", rule_options)
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+        with c1:
+            selected_rules = st.multiselect(
+                "Rule",
+                options=rule_options,
+                default=default_rules,
             )
-            st.markdown("#### Affected trades")
-            st.dataframe(
-                affected[[
-                    "trade_id",
-                    "open_date",
-                    "close_date",
-                    "contract_key",
-                    "baseline_net_pnl",
-                    "simulated_net_pnl",
-                    "delta",
-                    "override_reason",
-                ]].sort_values("close_date", ascending=False),
-                use_container_width=True,
+        with c2:
+            underlying_options = sorted(sim_trades["underlying"].dropna().unique().tolist())
+            selected_underlyings = st.multiselect(
+                "Underlying",
+                options=underlying_options,
+                default=underlying_options,
             )
+        with c3:
+            close_dates = pd.to_datetime(sim_trades["close_date"], errors="coerce").dropna()
+            min_date = close_dates.min().date() if not close_dates.empty else date.today()
+            max_date = close_dates.max().date() if not close_dates.empty else date.today()
+            date_range = st.date_input("Close date range", (min_date, max_date))
+        with c4:
+            only_changed = st.checkbox("Only changed trades", value=True)
+
+        filtered = sim_trades.copy()
+        if selected_rules:
+            filtered = filtered[filtered["rules_applied"].apply(lambda rules: any(r in rules for r in selected_rules))]
+        if selected_underlyings:
+            filtered = filtered[filtered["underlying"].isin(selected_underlyings)]
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start, end = date_range
+            filtered = filtered[
+                (pd.to_datetime(filtered["close_date"], errors="coerce").dt.date >= start)
+                & (pd.to_datetime(filtered["close_date"], errors="coerce").dt.date <= end)
+            ]
+        if only_changed:
+            filtered = filtered[filtered["simulated_net_pnl"] != filtered["baseline_net_pnl"]]
+
+        baseline_sum = float(filtered["baseline_net_pnl"].sum()) if not filtered.empty else 0.0
+        simulated_sum = float(filtered["simulated_net_pnl"].sum()) if not filtered.empty else 0.0
+        delta_sum = simulated_sum - baseline_sum
+
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Baseline sum", format_currency(baseline_sum))
+        t2.metric("Simulated sum", format_currency(simulated_sum))
+        t3.metric("Delta", format_currency(delta_sum))
+        if abs((baseline_sum + delta_sum) - simulated_sum) > 0.01:
+            st.error("Totals do not reconcile within $0.01. Adjust filters or review the simulation output.")
+
+        if filtered.empty:
+            st.info("No trades match the selected filters.")
+            return
+
+        st.dataframe(
+            filtered[[
+                "trade_id",
+                "open_date",
+                "close_date",
+                "underlying",
+                "contract_key",
+                "baseline_net_pnl",
+                "simulated_net_pnl",
+                "delta",
+                "why_changed",
+                "rules_applied_label",
+            ]].sort_values("close_date", ascending=False),
+            use_container_width=True,
+        )
 
 def render_rules_coach_diagnostics(
     closed_trades: pd.DataFrame,
@@ -1318,8 +1455,8 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
         [
             {
                 "label": "Month net P&L",
-                "value": f"${month_pnl:,.0f}",
-                "sub": f"Avg per trading day: ${avg_day_pnl:,.0f}",
+                "value": format_currency(month_pnl),
+                "sub": f"Avg per trading day: {format_currency(avg_day_pnl)}",
             },
             {
                 "label": "Green days",
@@ -1434,7 +1571,7 @@ def render_pnl_calendar(daily_pnl_df: pd.DataFrame, month_yyyy_mm: str) -> Optio
                     else:
                         bg_color = "rgba(220, 220, 220, 0.6)"
 
-                pnl_label = f"${day_pnl:,.0f}"
+                pnl_label = format_currency(day_pnl)
                 day_param = day_date.isoformat()
                 card_html = f"""
                 <form class="pnl-card-form" action="" method="get">
@@ -1718,7 +1855,7 @@ def build_share_image(
             ax.add_patch(rect)
             ax.text(x + 0.01, y + 0.02, str(day), fontsize=8, color="#e2e8f0")
             if pnl != 0:
-                ax.text(x + 0.01, y + 0.045, f"{pnl:,.0f}", fontsize=7, color="#e2e8f0")
+                ax.text(x + 0.01, y + 0.045, f"{pnl:,.2f}", fontsize=7, color="#e2e8f0")
 
     if summary.get("top_winner"):
         ax.text(0.65, 0.9, f"Top winner: {summary['top_winner']}", fontsize=10, color="#34d399")
@@ -1951,6 +2088,12 @@ if not openpos.empty:
             "underlying": row["underlying"],
             "details": f"{row['side']} {row['qty']} @ {row['price']}",
         })
+        issues.append({
+            "issue_type": "Open qty leftover",
+            "trade_dt": row["date"],
+            "underlying": row["underlying"],
+            "details": f"{row['side']} {row['qty']} @ {row['price']}",
+        })
 
 has_issues = duplicate_count > 0 or recon["unmatched_legs"] > 0 or recon["open_qty"] > 0
 status_icon = "✅" if not has_issues else "⚠️"
@@ -1959,25 +2102,62 @@ status_class = "status-clean" if not has_issues else "status-warn"
 st.markdown("### Reconciliation & Data Quality")
 render_status_cards(
     [
-        {"label": "Rows parsed", "value": f"{recon['raw_rows']:,}", "status_class": status_class},
-        {"label": "Files uploaded", "value": f"{recon['file_count']:,}", "status_class": status_class},
+        {
+            "label": "Rows parsed",
+            "value": f"{recon['raw_rows']:,}",
+            "status_class": status_class,
+            "sub": "All rows loaded from the selected CSVs.",
+        },
+        {
+            "label": "Files uploaded",
+            "value": f"{recon['file_count']:,}",
+            "status_class": status_class,
+            "sub": "Unique CSV sources included in this run.",
+        },
         {
             "label": "Date range",
             "value": date_range_label,
             "status_class": status_class,
+            "sub": "Coverage window of your uploaded history.",
         },
-        {"label": "Duplicates removed", "value": f"{recon['duplicate_count']:,}", "status_class": status_class},
-        {"label": "Unmatched legs", "value": f"{recon['unmatched_legs']:,}", "status_class": status_class},
-        {"label": "Open qty leftover", "value": f"{recon['open_qty']:,}", "status_class": status_class},
+        {
+            "label": "Duplicates removed",
+            "value": f"{recon['duplicate_count']:,}",
+            "status_class": status_class,
+            "sub": (
+                "Overlapping CSV ranges detected; duplicates removed using key: "
+                "trade_dt|side|qty|price|fees|multiplier|asset_type|underlying|expiry|strike|right."
+            ),
+        },
+        {
+            "label": "Unmatched legs",
+            "value": f"{recon['unmatched_legs']:,}",
+            "status_class": status_class,
+            "sub": (
+                "Options legs present without a matching open/close in this dataset. "
+                "Usually caused by missing date ranges. Upload older CSVs until this drops."
+            ),
+        },
+        {
+            "label": "Open qty leftover",
+            "value": f"{recon['open_qty']:,}",
+            "status_class": status_class,
+            "sub": (
+                "Positions still open at end of dataset OR missing closes. Realized P&L for "
+                "matched closes is still valid; open/unrealized may be impacted."
+            ),
+        },
         {
             "label": "Fees included",
-            "value": f"{'Yes' if recon['fees_included'] else 'No'} ({', '.join(recon['fee_columns']) or '—'})",
+            "value": f"{'Yes' if recon['fees_included'] else 'No'}",
             "status_class": "status-clean" if recon["fees_included"] else "status-warn",
+            "sub": f"Fees included from columns: {', '.join(recon['fee_columns']) or '—'}.",
         },
         {
             "label": "Roll detection",
             "value": recon["roll_confidence"],
             "status_class": status_class,
+            "sub": "Heuristic only. Review suggested if open qty leftover or unmatched legs are nonzero.",
         },
     ]
 )
@@ -1985,11 +2165,59 @@ render_status_cards(
 if has_issues:
     st.warning(f"{status_icon} Issues detected — review before trusting results.")
 
+issue_df = pd.DataFrame(issues)
+severity_map = {
+    "Duplicate fill": "LOW",
+    "Unmatched/open leg": "MED",
+    "Open qty leftover": "MED",
+    "Parse errors / missing required columns": "HIGH",
+}
+summary_table = pd.DataFrame(columns=["issue_type", "count", "severity"])
+if not issue_df.empty:
+    summary_table = (issue_df.groupby("issue_type", as_index=False)
+                     .agg(count=("issue_type", "size")))
+    summary_table["severity"] = summary_table["issue_type"].map(severity_map).fillna("MED")
+    summary_table = summary_table.sort_values(["severity", "count"], ascending=[False, False])
+
 with st.expander("View issues", expanded=has_issues):
-    if issues:
-        st.dataframe(pd.DataFrame(issues).head(50), use_container_width=True)
-    else:
+    if summary_table.empty:
         st.success("No reconciliation issues detected.")
+    else:
+        st.markdown("**Issue summary**")
+        st.dataframe(summary_table[["issue_type", "count", "severity"]], use_container_width=True)
+        issue_types = summary_table["issue_type"].tolist()
+        selected_issue = st.selectbox("Issue type", options=issue_types)
+        sample_rows = issue_df[issue_df["issue_type"] == selected_issue].head(25)
+        st.markdown("**Sample rows (max 25)**")
+        st.dataframe(sample_rows, use_container_width=True)
+
+    show_fix = st.button("Fix suggestions")
+    with st.expander("How to fix these issues", expanded=show_fix):
+        if recon["unmatched_legs"] > 0 or recon["open_qty"] > 0:
+            affected_dates = pd.to_datetime(openpos["date"], errors="coerce")
+            earliest_date = affected_dates.min() if not affected_dates.empty else pd.NaT
+            if pd.isna(earliest_date):
+                st.write("No issues detected ✅")
+            else:
+                st.markdown(f"**Earliest missing date:** {earliest_date.date().isoformat()}")
+                st.markdown("**Suggested Fidelity export windows (90-day chunks):**")
+                start = earliest_date.date()
+                end = date.today()
+                windows = []
+                while start <= end:
+                    window_end = min(start + timedelta(days=89), end)
+                    windows.append(f"{start.isoformat()} → {window_end.isoformat()}")
+                    start = window_end + timedelta(days=1)
+                for window in windows[:4]:
+                    st.markdown(f"- {window}")
+                if len(windows) > 4:
+                    st.markdown(f"- ... ({len(windows)} total windows)")
+                top_under = (openpos["underlying"].value_counts().head(5).index.tolist()
+                             if not openpos.empty else [])
+                if top_under:
+                    st.markdown("**Top underlyings affected:** " + ", ".join(top_under))
+        else:
+            st.write("No issues detected ✅")
 
 nav_tabs = ["Overview", "Journal", "Options", "Diagnostics", "Export", "Settings"]
 nav_index = nav_tabs.index(st.session_state.get("nav_tab", "Overview"))
@@ -2029,6 +2257,12 @@ if nav_selection == "Overview":
     if trades_sheet.empty:
         st.info("No closed trades to display yet.")
     else:
+        if recon["unmatched_legs"] > 0 or recon["open_qty"] > 0:
+            st.warning(
+                "Issues detected. Realized P&L for matched closes is valid; simulations and open-position stats "
+                "may be impacted until you upload missing history."
+            )
+
         pnl_total = float(trades_sheet["net_pnl"].sum())
         winrate = float((trades_sheet["net_pnl"] > 0).mean())
         wins = trades_sheet[trades_sheet["net_pnl"] > 0]["net_pnl"]
@@ -2045,41 +2279,43 @@ if nav_selection == "Overview":
 
         render_stat_cards(
             [
-                {"label": "Realized P&L", "value": f"${pnl_total:,.2f}", "sub": "Closed trades only"},
-                {"label": "Win rate", "value": f"{winrate*100:,.1f}%", "sub": "Realized only"},
+                {"label": "Realized P&L", "value": format_currency(pnl_total), "sub": "Closed trades only"},
+                {"label": "Win rate", "value": format_percent(winrate * 100), "sub": "Realized only"},
                 {"label": "Profit factor", "value": "∞" if np.isinf(profit_factor) else f"{profit_factor:,.2f}", "sub": "Realized only"},
-                {"label": "Max drawdown", "value": f"${abs(max_dd):,.2f}", "sub": "Realized equity curve"},
+                {"label": "Max drawdown", "value": format_currency(abs(max_dd)), "sub": "Realized equity curve"},
                 {"label": "# Trades", "value": f"{len(trades_sheet):,}", "sub": "Closed matches"},
-                {"label": "Avg win / Avg loss", "value": f"${avg_win:,.0f} / ${avg_loss:,.0f}", "sub": "Realized only"},
+                {
+                    "label": "Avg win / Avg loss",
+                    "value": f"{format_currency(avg_win)} / {format_currency(avg_loss)}",
+                    "sub": "Realized only",
+                },
             ]
         )
 
         render_rules_coach_overview(trades_sheet, work)
 
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.markdown("#### Equity curve + drawdown (realized)")
-            st.line_chart(curve.set_index("close_date")[["cum_net", "drawdown"]])
-        with c2:
-            st.markdown("#### Top 3 leaks costing you money")
-            summary_by_type = mistake_output["summary_by_type"]
-            if summary_by_type.empty:
-                st.info("No rule-based leaks detected yet.")
-            else:
-                top_leaks = summary_by_type.head(3).to_dict("records")
-                for leak in top_leaks:
-                    rule_text = LEAK_RULES.get(leak["mistake_type"], "Follow your risk rules.")
-                    st.markdown(
-                        f"**{leak['mistake_type']}**  \n"
-                        f"Damage: ${leak['total_damage']:,.2f} • Count: {int(leak['count'])}  \n"
-                        f"_Rule_: {rule_text}",
-                    )
-                    st.button(
-                        "Show examples",
-                        key=f"leak-{leak['mistake_type']}",
-                        on_click=navigate_to_diagnostics,
-                        args=(leak["mistake_type"],),
-                    )
+        st.markdown("#### Top 3 leaks costing you money")
+        summary_by_type = mistake_output["summary_by_type"]
+        if summary_by_type.empty:
+            st.info("No rule-based leaks detected yet.")
+        else:
+            top_leaks = summary_by_type.head(3).to_dict("records")
+            for leak in top_leaks:
+                rule_text = LEAK_RULES.get(leak["mistake_type"], "Follow your risk rules.")
+                st.markdown(
+                    f"**{leak['mistake_type']}**  \n"
+                    f"Damage: {format_currency(leak['total_damage'])} • Count: {int(leak['count'])}  \n"
+                    f"_Rule_: {rule_text}",
+                )
+                st.button(
+                    "Show examples",
+                    key=f"leak-{leak['mistake_type']}",
+                    on_click=navigate_to_diagnostics,
+                    args=(leak["mistake_type"],),
+                )
+
+        st.markdown("#### Equity curve + drawdown (realized)")
+        st.line_chart(curve.set_index("close_date")[["cum_net", "drawdown"]])
 
         st.markdown("#### Daily P&L calendar (realized)")
         if daily_pnl.empty:
