@@ -1,12 +1,17 @@
 import calendar
 import csv
+import hashlib
 import io
+import json
 import os
 import re
+import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -16,6 +21,16 @@ st.set_page_config(page_title="Trade Analyzer (IBKR + Fidelity)", layout="wide")
 st.markdown(
     """
     <style>
+        :root {
+            --bg-card: rgba(15, 23, 42, 0.5);
+            --border-subtle: rgba(148, 163, 184, 0.12);
+            --text-muted: #94a3b8;
+        }
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin: 1.2rem 0 0.6rem 0;
+        }
         .dashboard-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -46,12 +61,50 @@ st.markdown(
             font-size: 0.85rem;
             margin-top: 6px;
         }
+        .stat-sub {
+            color: #cbd5f5;
+            font-size: 0.8rem;
+            margin-top: 6px;
+        }
         .section-card {
-            background: rgba(15, 23, 42, 0.5);
-            border: 1px solid rgba(148, 163, 184, 0.12);
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
             border-radius: 18px;
             padding: 16px 18px 6px;
             margin-bottom: 16px;
+        }
+        .status-card {
+            background: rgba(15, 23, 42, 0.75);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 16px;
+            padding: 14px 16px;
+        }
+        .status-label {
+            font-size: 0.78rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .status-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #e2e8f0;
+        }
+        .status-clean {
+            color: #22c55e;
+        }
+        .status-warn {
+            color: #f59e0b;
+        }
+        .pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(148, 163, 184, 0.2);
         }
     </style>
     """,
@@ -71,6 +124,159 @@ def render_stat_cards(items: List[Dict[str, str]]) -> None:
     )
     st.markdown(f"<div class='dashboard-grid'>{cards}</div>", unsafe_allow_html=True)
 
+def render_status_cards(items: List[Dict[str, str]]) -> None:
+    cards = "".join(
+        [
+            "<div class='status-card'>"
+            f"<div class='status-label'>{item['label']}</div>"
+            f"<div class='status-value {item.get('status_class', '')}'>"
+            f"{item['value']}</div>"
+            f"<div class='stat-sub'>{item.get('sub', '')}</div>"
+            "</div>"
+            for item in items
+        ]
+    )
+    st.markdown(f"<div class='dashboard-grid'>{cards}</div>", unsafe_allow_html=True)
+
+def get_db_conn() -> sqlite3.Connection:
+    db_path = os.getenv("APP_DB_PATH", "app.db")
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db() -> None:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_subscribed INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            session_id TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            details_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    salt = os.getenv("APP_SALT", "trade-analyzer")
+    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = ?", (email.lower(),))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def create_user(email: str, password: str) -> Dict[str, Any]:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    password_hash = hash_password(password)
+    created_at = datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO users (email, password_hash, is_subscribed, created_at) VALUES (?, ?, ?, ?)",
+        (email.lower(), password_hash, 0, created_at),
+    )
+    conn.commit()
+    user_id = cur.lastrowid
+    conn.close()
+    return {
+        "id": user_id,
+        "email": email.lower(),
+        "password_hash": password_hash,
+        "is_subscribed": 0,
+        "created_at": created_at,
+    }
+
+def verify_user(email: str, password: str) -> Optional[Dict[str, Any]]:
+    user = get_user_by_email(email)
+    if not user:
+        return None
+    if user["password_hash"] != hash_password(password):
+        return None
+    return user
+
+def set_subscription(user_id: int, is_subscribed: bool) -> None:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET is_subscribed = ? WHERE id = ?",
+        (1 if is_subscribed else 0, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+def save_run_summary(user_id: int, summary: Dict[str, Any]) -> None:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO runs (user_id, created_at, summary_json) VALUES (?, ?, ?)",
+        (user_id, datetime.utcnow().isoformat(), json.dumps(summary)),
+    )
+    conn.commit()
+    conn.close()
+
+def load_run_summaries(user_id: int) -> pd.DataFrame:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT created_at, summary_json FROM runs WHERE user_id = ? ORDER BY created_at DESC",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    data = []
+    for row in rows:
+        payload = json.loads(row["summary_json"])
+        payload["created_at"] = row["created_at"]
+        data.append(payload)
+    return pd.DataFrame(data)
+
+def log_event(event_name: str, user_id: Optional[int] = None, details: Optional[Dict[str, Any]] = None) -> None:
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO events (user_id, session_id, event_name, details_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            user_id,
+            st.session_state.get("session_id"),
+            event_name,
+            json.dumps(details or {}),
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
 APP_PASS = os.getenv("APP_PASS", "")
 
 if APP_PASS:
@@ -84,6 +290,14 @@ if APP_PASS:
         st.stop()
 
 # ---------------------------------------------------------------------------------------
+init_db()
+
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+if "nav_tab" not in st.session_state:
+    st.session_state["nav_tab"] = "Overview"
 
 
 
@@ -99,6 +313,13 @@ POST_MORTEM_TAGS = [
     "Rolled to avoid loss",
 ]
 UNASSIGNED_TAG = "(unassigned)"
+LEAK_RULES = {
+    "Overtrading day": "Avoid high-frequency churn on red days.",
+    "Big loss outlier": "Cap maximum loss per trade.",
+    "Held losers longer": "Cut losers faster than winners.",
+    "Gave back gains in ticker": "Stop trading tickers that flip to net negative.",
+    "Averaged down (added to loser)": "No adding to losing positions.",
+}
 
 def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
     """
@@ -465,23 +686,36 @@ def detect_mistakes(closed_trades: pd.DataFrame, fills: Optional[pd.DataFrame]) 
     if fills is not None and not fills.empty:
         fills_work = fills.copy()
         fills_work["contract_key"] = _contract_key(fills_work)
+        fills_work["price"] = pd.to_numeric(fills_work["price"], errors="coerce").fillna(0.0)
         for contract_key, g in fills_work.sort_values("trade_dt").groupby("contract_key", sort=False):
             net_pos = 0
+            avg_price = 0.0
             add_events = 0
             for _, r in g.iterrows():
                 side = str(r["side"]).upper()
                 qty = int(r["qty"])
+                price = float(r["price"])
                 before = net_pos
                 if side == "BUY":
                     net_pos += qty
                     if before >= 0 and net_pos > before:
-                        add_events += 1
+                        if before > 0 and price < avg_price:
+                            add_events += 1
+                        avg_price = ((avg_price * before) + price * qty) / max(net_pos, 1)
+                    elif net_pos > 0:
+                        avg_price = ((avg_price * max(before, 0)) + price * qty) / max(net_pos, 1)
                 elif side == "SELL":
                     net_pos -= qty
                     if before <= 0 and net_pos < before:
-                        add_events += 1
+                        if before < 0 and price > avg_price:
+                            add_events += 1
+                        avg_price = ((avg_price * abs(before)) + price * qty) / max(abs(net_pos), 1)
+                    elif net_pos < 0:
+                        avg_price = ((avg_price * abs(before)) + price * qty) / max(abs(net_pos), 1)
+                if net_pos == 0:
+                    avg_price = 0.0
             contract_net = float(base.loc[base["contract_key"] == contract_key, "net_pnl"].sum())
-            if add_events >= 2 and contract_net < 0:
+            if add_events >= 1 and contract_net < 0:
                 parts = contract_key.split("|")
                 mistakes.append({
                     "mistake_type": "Averaged down (added to loser)",
@@ -490,7 +724,7 @@ def detect_mistakes(closed_trades: pd.DataFrame, fills: Optional[pd.DataFrame]) 
                     "underlying": parts[0] if parts else "UNKNOWN",
                     "contract_key": contract_key,
                     "trade_id": contract_key,
-                    "details": f"{add_events} adds, net {contract_net:.2f}",
+                    "details": f"{add_events} adds at worse price, net {contract_net:.2f}",
                     "net_pnl": contract_net,
                 })
 
@@ -868,92 +1102,272 @@ def normalize_ibkr(df: pd.DataFrame, mapping: Dict[str, str], include_stocks: bo
     )
     return w.sort_values("trade_dt").reset_index(drop=True)
 
+def build_dedupe_key(df: pd.DataFrame) -> pd.Series:
+    expiry = pd.to_datetime(df["expiry"], errors="coerce").dt.date.astype(str)
+    strike = pd.to_numeric(df["strike"], errors="coerce").round(4).astype(str)
+    price = pd.to_numeric(df["price"], errors="coerce").round(6).astype(str)
+    fees = pd.to_numeric(df["fees"], errors="coerce").round(6).astype(str)
+    mult = pd.to_numeric(df["multiplier"], errors="coerce").round(6).astype(str)
+    trade_dt = pd.to_datetime(df["trade_dt"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    parts = [
+        trade_dt,
+        df["side"].astype(str),
+        df["qty"].astype(str),
+        price,
+        fees,
+        mult,
+        df["asset_type"].astype(str),
+        df["underlying"].astype(str),
+        expiry,
+        strike,
+        df["right"].astype(str),
+    ]
+    return pd.Series(["|".join(vals) for vals in zip(*parts)], index=df.index)
+
+def compute_reconciliation_metrics(
+    raw_rows: int,
+    file_count: int,
+    work: pd.DataFrame,
+    open_positions: pd.DataFrame,
+    duplicate_count: int,
+    fee_columns: List[str],
+) -> Dict[str, Any]:
+    date_min = pd.to_datetime(work["trade_dt"], errors="coerce").min()
+    date_max = pd.to_datetime(work["trade_dt"], errors="coerce").max()
+    unmatched_legs = int((open_positions["asset_type"] == "Option").sum()) if not open_positions.empty else 0
+    open_qty = int(open_positions["qty"].sum()) if not open_positions.empty else 0
+    fees_included = len(fee_columns) > 0
+    roll_confidence = "Basic OK" if unmatched_legs == 0 and open_qty == 0 else "Needs review"
+    return {
+        "raw_rows": raw_rows,
+        "file_count": file_count,
+        "date_range": (date_min, date_max),
+        "duplicate_count": duplicate_count,
+        "unmatched_legs": unmatched_legs,
+        "open_qty": open_qty,
+        "fees_included": fees_included,
+        "fee_columns": fee_columns,
+        "roll_confidence": roll_confidence,
+    }
+
+def build_share_image(
+    daily_pnl: pd.DataFrame,
+    month_str: str,
+    summary: Dict[str, Any],
+    top_leaks: List[Dict[str, Any]],
+) -> bytes:
+    year, month = [int(part) for part in month_str.split("-")]
+    month_days = calendar.monthcalendar(year, month)
+    pnl_map = {pd.to_datetime(r["trade_day"]).day: float(r["net_pnl"]) for _, r in daily_pnl.iterrows()}
+
+    fig = plt.figure(figsize=(9, 6), dpi=150)
+    fig.patch.set_facecolor("#0f172a")
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    ax.text(0.02, 0.95, f"Trade Month Summary — {month_str}", fontsize=16, fontweight="bold", color="#f8fafc")
+    ax.text(0.02, 0.90, f"Realized P&L: ${summary['realized_pnl']:,.2f}", fontsize=12, color="#38bdf8")
+    ax.text(0.35, 0.90, f"Max drawdown: ${summary['max_drawdown']:,.2f}", fontsize=12, color="#f87171")
+
+    for idx, leak in enumerate(top_leaks[:3]):
+        ax.text(
+            0.02,
+            0.84 - idx * 0.04,
+            f"Leak #{idx + 1}: {leak['mistake_type']} (${leak['total_damage']:,.2f})",
+            fontsize=10,
+            color="#fbbf24",
+        )
+
+    cal_top = 0.72
+    cell_w = 0.12
+    cell_h = 0.08
+    weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    for i, wd in enumerate(weekdays):
+        ax.text(0.02 + i * cell_w, cal_top + 0.05, wd, fontsize=9, color="#94a3b8")
+
+    max_abs = max(abs(v) for v in pnl_map.values()) if pnl_map else 1
+    for week_idx, week in enumerate(month_days):
+        for day_idx, day in enumerate(week):
+            x = 0.02 + day_idx * cell_w
+            y = cal_top - week_idx * cell_h
+            if day == 0:
+                rect = plt.Rectangle((x, y), cell_w - 0.01, cell_h - 0.01, color="#1e293b", alpha=0.4)
+                ax.add_patch(rect)
+                continue
+            pnl = pnl_map.get(day, 0.0)
+            norm = pnl / max_abs if max_abs else 0
+            if pnl > 0:
+                color = (0.12, 0.8, 0.5, 0.35 + 0.4 * min(abs(norm), 1))
+            elif pnl < 0:
+                color = (0.96, 0.38, 0.38, 0.35 + 0.4 * min(abs(norm), 1))
+            else:
+                color = (0.3, 0.3, 0.4, 0.3)
+            rect = plt.Rectangle((x, y), cell_w - 0.01, cell_h - 0.01, color=color)
+            ax.add_patch(rect)
+            ax.text(x + 0.01, y + 0.02, str(day), fontsize=8, color="#e2e8f0")
+            if pnl != 0:
+                ax.text(x + 0.01, y + 0.045, f"{pnl:,.0f}", fontsize=7, color="#e2e8f0")
+
+    if summary.get("top_winner"):
+        ax.text(0.65, 0.9, f"Top winner: {summary['top_winner']}", fontsize=10, color="#34d399")
+    if summary.get("top_loser"):
+        ax.text(0.65, 0.86, f"Top loser: {summary['top_loser']}", fontsize=10, color="#f87171")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
 # -------------------------
 # UI
 # -------------------------
-st.title("Trade Analyzer (IBKR + Fidelity) — Options/Stocks FIFO P&L → Excel")
-st.caption("Supports Fidelity 'Accounts History' CSV (with disclaimer footer) and IBKR CSV (with mapping).")
+st.title("Trade Analyzer Pro")
+st.caption("Upload Fidelity or IBKR fills. The app reconciles, dedupes, and separates realized vs unrealized results.")
+
 include_stocks = st.toggle(
     "Include stock trades in P&L calculations",
     value=False,
     help="When enabled, equity trades are included alongside options.",
 )
 
-uploaded = st.file_uploader("Upload CSV", type=["csv", "txt"])
-if not uploaded:
+uploaded_files = st.file_uploader("Upload CSVs (multi-file supported)", type=["csv", "txt"], accept_multiple_files=True)
+if not uploaded_files:
     st.stop()
 
-try:
-    df = load_csv_bytes(uploaded.getvalue())
-except Exception as e:
-    st.error(f"Could not read CSV: {e}")
-    st.stop()
+log_event("file_uploaded", details={"file_count": len(uploaded_files)}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
 
-detected = detect_broker(list(df.columns))
-choice = st.selectbox("Broker format", ["Auto", "Fidelity", "IBKR"], index=0)
-broker = detected if choice == "Auto" else choice
-st.info(f"Detected: **{detected}** | Using: **{broker}**")
-
-with st.expander("Debug: columns"):
-    st.write(list(df.columns))
-    st.write(df.head(3))
-
-work = None
-
-if broker == "Fidelity":
+file_entries = []
+raw_rows = 0
+fee_columns: List[str] = []
+file_errors = []
+for idx, up in enumerate(uploaded_files):
     try:
-        work = normalize_fidelity(df, include_stocks)
+        df = load_csv_bytes(up.getvalue())
     except Exception as e:
-        st.error(f"Failed to parse Fidelity file: {e}")
-        st.stop()
-elif broker == "IBKR":
-    cols = list(df.columns)
+        file_errors.append(f"{up.name}: {e}")
+        continue
+    raw_rows += len(df)
+    detected = detect_broker(list(df.columns))
+    file_entries.append({"file": up, "df": df, "detected": detected, "broker": detected, "index": idx})
 
-    def pick_like(candidates):
-        for cand in candidates:
-            for c in cols:
-                if cand.lower() == str(c).lower():
-                    return c
-        for cand in candidates:
-            for c in cols:
-                if cand.lower() in str(c).lower():
-                    return c
-        return cols[0] if cols else None
-
-    with st.expander("IBKR column mapping", expanded=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            col_datetime = st.selectbox("Trade datetime column", cols, index=cols.index(pick_like(["Date/Time", "Date", "TradeDate", "Timestamp"])))
-            col_symbol = st.selectbox("Symbol / Description column", cols, index=cols.index(pick_like(["Symbol", "Description", "Instrument"])))
-            col_side = st.selectbox("Side column (BUY/SELL)", cols, index=cols.index(pick_like(["Side", "Action", "Buy/Sell", "B/S"])))
-            col_qty = st.selectbox("Quantity column", cols, index=cols.index(pick_like(["Quantity", "Qty", "Size"])))
-        with c2:
-            col_price = st.selectbox("Price column (per contract premium)", cols, index=cols.index(pick_like(["Price", "TradePrice", "FillPrice"])))
-            col_fees = st.selectbox("Fees/Commission column (optional)", ["(none)"] + cols, index=0)
-            col_mult = st.selectbox("Multiplier column (optional)", ["(none)"] + cols, index=0)
-
-    mapping = {
-        "datetime": col_datetime,
-        "symbol": col_symbol,
-        "side": col_side,
-        "qty": col_qty,
-        "price": col_price,
-        "fees": None if col_fees == "(none)" else col_fees,
-        "multiplier": None if col_mult == "(none)" else col_mult,
-    }
-
-    try:
-        work = normalize_ibkr(df, mapping, include_stocks)
-    except Exception as e:
-        st.error(f"Failed to parse IBKR file: {e}")
-        st.stop()
-else:
-    st.error("Could not auto-detect broker. Choose Fidelity or IBKR.")
+if file_errors:
+    st.error("Some files could not be parsed:\n" + "\n".join(file_errors))
+    log_event("error", details={"errors": file_errors}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
     st.stop()
 
-if work is None or work.empty:
-    st.warning("No trades parsed from this file.")
+def pick_like(cols: List[str], candidates: List[str]) -> str:
+    for cand in candidates:
+        for c in cols:
+            if cand.lower() == str(c).lower():
+                return c
+    for cand in candidates:
+        for c in cols:
+            if cand.lower() in str(c).lower():
+                return c
+    return cols[0] if cols else ""
+
+with st.expander("Upload details & column mapping", expanded=False):
+    for entry in file_entries:
+        st.markdown(f"**{entry['file'].name}**")
+        cols = list(entry["df"].columns)
+        choice = st.selectbox(
+            "Broker format",
+            ["Auto", "Fidelity", "IBKR"],
+            index=0,
+            key=f"broker-{entry['index']}",
+        )
+        broker = entry["detected"] if choice == "Auto" else choice
+        entry["broker"] = broker
+        st.caption(f"Detected: {entry['detected']} | Using: {broker}")
+        if broker == "IBKR":
+            c1, c2 = st.columns(2)
+            with c1:
+                col_datetime = st.selectbox(
+                    "Trade datetime",
+                    cols,
+                    index=cols.index(pick_like(cols, ["Date/Time", "Date", "TradeDate", "Timestamp"])),
+                    key=f"dt-{entry['index']}",
+                )
+                col_symbol = st.selectbox(
+                    "Symbol/Description",
+                    cols,
+                    index=cols.index(pick_like(cols, ["Symbol", "Description", "Instrument"])),
+                    key=f"sym-{entry['index']}",
+                )
+                col_side = st.selectbox(
+                    "Side",
+                    cols,
+                    index=cols.index(pick_like(cols, ["Side", "Action", "Buy/Sell", "B/S"])),
+                    key=f"side-{entry['index']}",
+                )
+                col_qty = st.selectbox(
+                    "Quantity",
+                    cols,
+                    index=cols.index(pick_like(cols, ["Quantity", "Qty", "Size"])),
+                    key=f"qty-{entry['index']}",
+                )
+            with c2:
+                col_price = st.selectbox(
+                    "Price",
+                    cols,
+                    index=cols.index(pick_like(cols, ["Price", "TradePrice", "FillPrice"])),
+                    key=f"price-{entry['index']}",
+                )
+                col_fees = st.selectbox(
+                    "Fees/Commission",
+                    ["(none)"] + cols,
+                    index=0,
+                    key=f"fees-{entry['index']}",
+                )
+                col_mult = st.selectbox(
+                    "Multiplier",
+                    ["(none)"] + cols,
+                    index=0,
+                    key=f"mult-{entry['index']}",
+                )
+            entry["mapping"] = {
+                "datetime": col_datetime,
+                "symbol": col_symbol,
+                "side": col_side,
+                "qty": col_qty,
+                "price": col_price,
+                "fees": None if col_fees == "(none)" else col_fees,
+                "multiplier": None if col_mult == "(none)" else col_mult,
+            }
+        elif broker == "Fidelity":
+            entry["mapping"] = None
+        else:
+            st.warning("Unable to detect broker format. Select Fidelity or IBKR.")
+
+normalized_frames = []
+for entry in file_entries:
+    broker = entry["broker"]
+    df = entry["df"]
+    if broker == "Fidelity":
+        normalized = normalize_fidelity(df, include_stocks)
+        fee_columns.extend([col for col in ["Commission", "Fees"] if col in df.columns])
+    elif broker == "IBKR":
+        mapping = entry.get("mapping")
+        if mapping is None:
+            continue
+        normalized = normalize_ibkr(df, mapping, include_stocks)
+        if mapping.get("fees"):
+            fee_columns.append(mapping["fees"])
+    else:
+        continue
+    normalized["source_file"] = entry["file"].name
+    normalized_frames.append(normalized)
+
+if not normalized_frames:
+    st.warning("No trades parsed from these files.")
     st.stop()
+
+work = pd.concat(normalized_frames, ignore_index=True)
+work["dedupe_key"] = build_dedupe_key(work)
+duplicate_count = int(work.duplicated("dedupe_key").sum())
+dup_rows = work[work.duplicated("dedupe_key", keep="first")].copy()
+work = work.drop_duplicates("dedupe_key", keep="first").drop(columns=["dedupe_key"]).reset_index(drop=True)
 
 # FIFO per contract
 closed_all = []
@@ -981,569 +1395,300 @@ for cid, g in work.groupby("contract_id", sort=False):
 closed = pd.concat(closed_all, ignore_index=True) if closed_all else pd.DataFrame()
 openpos = pd.concat(open_all, ignore_index=True) if open_all else pd.DataFrame()
 
-st.header("1) Summary metrics")
-pnl_view = st.radio(
-    "P&L view",
-    ["Closed only (realized)", "Closed + Open (separate)"],
-    horizontal=True,
-)
-show_open = pnl_view == "Closed + Open (separate)"
-
-if not closed.empty:
-    render_stat_cards(
-        [
-            {
-                "label": "Realized net P&L",
-                "value": f"${closed['net_pnl'].sum():,.2f}",
-                "sub": "Closed trades only",
-            },
-            {
-                "label": "Closed matches",
-                "value": f"{len(closed):,}",
-                "sub": "FIFO matched",
-            },
-            {
-                "label": "Win rate",
-                "value": f"{(closed['net_pnl'] > 0).mean() * 100:,.1f}%",
-                "sub": "Closed trades",
-            },
-        ]
-    )
-else:
-    st.warning("No closed trades detected after FIFO matching (you may only have open positions).")
-
-if not openpos.empty:
-    side_sign = np.where(openpos["side"] == "SELL", 1.0, -1.0)
-    openpos["net_premium"] = (openpos["price"] * openpos["qty"] * openpos["multiplier"] * side_sign) - openpos["fees"]
-
-if show_open:
-    if not openpos.empty:
-        st.markdown("### Open positions (unrealized, shown separately)")
-        render_stat_cards(
-            [
-                {
-                    "label": "Open premium",
-                    "value": f"${openpos['net_premium'].sum():,.2f}",
-                    "sub": "Cashflow, not P&L",
-                },
-                {
-                    "label": "Open lots",
-                    "value": f"{len(openpos):,}",
-                    "sub": "Positions still open",
-                },
-            ]
-        )
-        st.dataframe(
-            openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]),
-            use_container_width=True,
-        )
-    else:
-        st.info("No open positions to show separately.")
-
 trades_sheet = closed.copy().reset_index(drop=True) if not closed.empty else pd.DataFrame()
 if not trades_sheet.empty:
     trades_sheet["trade_id"] = trades_sheet.index.astype(str)
 spy_trades = trades_sheet[trades_sheet["underlying"] == "SPY"].copy() if not trades_sheet.empty else pd.DataFrame()
 spy_total = float(spy_trades["net_pnl"].sum()) if not spy_trades.empty else 0.0
 
-# -------------------------
-# Advanced stats
-# -------------------------
-st.header("1b) Advanced Stats")
+log_event(
+    "analysis_run",
+    details={"closed_trades": len(trades_sheet), "open_positions": len(openpos)},
+    user_id=st.session_state["user"]["id"] if st.session_state["user"] else None,
+)
 
-if trades_sheet.empty:
-    st.info("No closed trades available for advanced stats.")
+recon = compute_reconciliation_metrics(
+    raw_rows=raw_rows,
+    file_count=len(uploaded_files),
+    work=work,
+    open_positions=openpos,
+    duplicate_count=duplicate_count,
+    fee_columns=sorted(set(fee_columns)),
+)
+
+date_min, date_max = recon["date_range"]
+if pd.isna(date_min) or pd.isna(date_max):
+    date_range_label = "—"
 else:
-    advanced = trades_sheet.copy()
-    advanced["close_time"] = pd.to_datetime(advanced[["buy_date", "sell_date"]].max(axis=1), errors="coerce")
-    advanced = advanced[advanced["close_time"].notna()].copy()
-    advanced = advanced.sort_values("close_time")
-    advanced["pnl"] = pd.to_numeric(advanced["net_pnl"], errors="coerce").fillna(0.0)
-    advanced["fees"] = pd.to_numeric(advanced.get("fees", 0.0), errors="coerce").fillna(0.0)
-    advanced["date"] = advanced["close_time"].dt.date
-    advanced["dow"] = advanced["close_time"].dt.dayofweek
-    advanced["hour"] = advanced["close_time"].dt.hour
-    advanced["symbol"] = advanced["underlying"].astype(str)
+    date_range_label = f"{date_min.date()} → {date_max.date()}"
 
-    starting_capital = st.number_input(
-        "Starting capital (optional, for Sharpe/Sortino/Kelly %)",
-        min_value=0.0,
-        value=0.0,
-        step=1000.0,
-        format="%.2f",
-    )
-    has_capital = starting_capital > 0
+issues = []
+if duplicate_count:
+    for _, row in dup_rows.head(50).iterrows():
+        issues.append({
+            "issue_type": "Duplicate fill",
+            "trade_dt": row["trade_dt"],
+            "underlying": row["underlying"],
+            "details": f"{row['side']} {row['qty']} @ {row['price']}",
+        })
+if not openpos.empty:
+    for _, row in openpos.head(50).iterrows():
+        issues.append({
+            "issue_type": "Unmatched/open leg",
+            "trade_dt": row["date"],
+            "underlying": row["underlying"],
+            "details": f"{row['side']} {row['qty']} @ {row['price']}",
+        })
 
-    n_trades = len(advanced)
-    wins = advanced[advanced["pnl"] > 0]["pnl"]
-    losses = advanced[advanced["pnl"] < 0]["pnl"]
+has_issues = duplicate_count > 0 or recon["unmatched_legs"] > 0 or recon["open_qty"] > 0
+status_icon = "✅" if not has_issues else "⚠️"
+status_class = "status-clean" if not has_issues else "status-warn"
 
-    winrate = float((advanced["pnl"] > 0).mean()) if n_trades else 0.0
-    gross_profit = float(wins.sum()) if not wins.empty else 0.0
-    gross_loss = abs(float(losses.sum())) if not losses.empty else 0.0
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-    expectancy = float(advanced["pnl"].mean()) if n_trades else 0.0
-
-    advanced["equity"] = advanced["pnl"].cumsum()
-    advanced["running_peak"] = advanced["equity"].cummax()
-    advanced["drawdown"] = advanced["equity"] - advanced["running_peak"]
-    max_dd_abs = abs(float(advanced["drawdown"].min())) if n_trades else 0.0
-    max_dd_pct = np.nan
-    if has_capital:
-        equity_with_capital = starting_capital + advanced["equity"]
-        peak = equity_with_capital.cummax()
-        dd_pct = (equity_with_capital - peak) / peak.replace(0, np.nan) * 100
-        max_dd_pct = abs(float(dd_pct.min())) if dd_pct.notna().any() else np.nan
-
-    sharpe_label = "Sharpe (unscaled)"
-    sortino_label = "Sortino (unscaled)"
-    sharpe_value = np.nan
-    sortino_value = np.nan
-    if has_capital:
-        sharpe_label = "Sharpe (daily)"
-        sortino_label = "Sortino (daily)"
-        daily_pnl = advanced.groupby("date", as_index=False)["pnl"].sum()
-        daily_returns = daily_pnl["pnl"] / starting_capital
-        if len(daily_returns) > 1 and daily_returns.std(ddof=1) != 0:
-            sharpe_value = (daily_returns.mean() / daily_returns.std(ddof=1)) * np.sqrt(252)
-        downside = daily_returns[daily_returns < 0]
-        if len(downside) > 1 and downside.std(ddof=1) != 0:
-            sortino_value = (daily_returns.mean() / downside.std(ddof=1)) * np.sqrt(252)
-        elif len(downside) == 0 and len(daily_returns) > 1:
-            sortino_value = np.inf
-    else:
-        returns = advanced["pnl"]
-        if len(returns) > 1 and returns.std(ddof=1) != 0:
-            sharpe_value = returns.mean() / returns.std(ddof=1)
-        downside = returns[returns < 0]
-        if len(downside) > 1 and downside.std(ddof=1) != 0:
-            sortino_value = returns.mean() / downside.std(ddof=1)
-        elif len(downside) == 0 and len(returns) > 1:
-            sortino_value = np.inf
-
-    kelly_pct = np.nan
-    avg_win = float(wins.mean()) if not wins.empty else np.nan
-    avg_loss = abs(float(losses.mean())) if not losses.empty else np.nan
-    if not np.isnan(avg_win) and not np.isnan(avg_loss) and avg_loss > 0:
-        b = avg_win / avg_loss
-        kelly = winrate - (1 - winrate) / b if b > 0 else np.nan
-        if not np.isnan(kelly):
-            kelly_pct = max(kelly, 0) * 100
-
-    if n_trades < 20:
-        st.warning("Stats may be noisy (fewer than 20 closed trades).")
-
-    max_dd_sub = "Absolute drawdown"
-    if has_capital and not np.isnan(max_dd_pct):
-        max_dd_sub = f"Peak-to-trough {max_dd_pct:,.1f}%"
-
-    render_stat_cards(
-        [
-            {
-                "label": "Winrate",
-                "value": f"{winrate * 100:,.1f}%",
-                "sub": "Closed trades only",
-            },
-            {
-                "label": "Profit factor",
-                "value": f"{profit_factor:,.2f}" if np.isfinite(profit_factor) else "∞",
-                "sub": "Gross wins / losses",
-            },
-            {
-                "label": "Expectancy",
-                "value": f"${expectancy:,.2f}",
-                "sub": "Avg P&L per trade",
-            },
-            {
-                "label": "Max drawdown",
-                "value": f"${max_dd_abs:,.2f}",
-                "sub": max_dd_sub,
-            },
-            {
-                "label": sharpe_label,
-                "value": "N/A" if np.isnan(sharpe_value) else f"{sharpe_value:,.2f}",
-                "sub": "Provide capital for scaled" if not has_capital else "Annualized",
-            },
-            {
-                "label": sortino_label,
-                "value": "N/A" if np.isnan(sortino_value) else ("∞" if np.isinf(sortino_value) else f"{sortino_value:,.2f}"),
-                "sub": "Downside deviation",
-            },
-            {
-                "label": "Kelly %",
-                "value": "N/A" if np.isnan(kelly_pct) else f"{kelly_pct:,.1f}%",
-                "sub": "Sizing guide only",
-            },
-        ]
-    )
-    st.caption("Kelly sizing note: practical position sizing often uses ¼–½ Kelly.")
-
-    chart_cols = st.columns(2)
-    with chart_cols[0]:
-        st.markdown("#### Equity curve (closed trades)")
-        st.line_chart(advanced.set_index("close_time")["equity"])
-    with chart_cols[1]:
-        st.markdown("#### P&L distribution per trade")
-        if advanced["pnl"].nunique() > 1:
-            hist_vals, bin_edges = np.histogram(advanced["pnl"], bins=25)
-            bin_labels = [f"{bin_edges[i]:.0f} to {bin_edges[i + 1]:.0f}" for i in range(len(bin_edges) - 1)]
-            hist_df = pd.DataFrame({"P&L bucket": bin_labels, "Trades": hist_vals})
-            st.bar_chart(hist_df.set_index("P&L bucket")["Trades"])
-        else:
-            st.info("Not enough P&L variation to build a histogram.")
-
-    st.markdown("#### Time-of-week performance")
-    day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    by_dow = (advanced.groupby("dow", as_index=False)
-              .agg(net_pnl=("pnl", "sum")))
-    by_dow["dow"] = by_dow["dow"].map({i: day_order[i] for i in range(7)})
-    by_dow["dow"] = pd.Categorical(by_dow["dow"], categories=day_order, ordered=True)
-    by_dow = by_dow.sort_values("dow")
-
-    by_hour = (advanced.groupby("hour", as_index=False)
-               .agg(net_pnl=("pnl", "sum"))
-               .sort_values("hour"))
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Net P&L by day of week**")
-        st.bar_chart(by_dow.set_index("dow")["net_pnl"])
-    with c2:
-        st.markdown("**Net P&L by hour of day**")
-        st.bar_chart(by_hour.set_index("hour")["net_pnl"])
-        if advanced["close_time"].dt.tz is None:
-            st.caption("Hour-of-day uses local time from the data (timezone not provided).")
-
-    st.markdown("#### Stats by market")
-    by_symbol = (advanced.groupby("symbol", as_index=False)
-                 .agg(
-                     trades=("pnl", "size"),
-                     total_pnl=("pnl", "sum"),
-                     winrate=("pnl", lambda s: float((s > 0).mean())),
-                     expectancy=("pnl", "mean"),
-                     gross_profit=("pnl", lambda s: float(s[s > 0].sum())),
-                     gross_loss=("pnl", lambda s: abs(float(s[s < 0].sum()))),
-                 ))
-    by_symbol["profit_factor"] = by_symbol.apply(
-        lambda r: r["gross_profit"] / r["gross_loss"] if r["gross_loss"] > 0 else np.inf,
-        axis=1,
-    )
-    by_symbol = by_symbol.drop(columns=["gross_profit", "gross_loss"]).sort_values("total_pnl", ascending=False)
-    by_symbol["winrate"] = by_symbol["winrate"] * 100
-    st.dataframe(
-        by_symbol,
-        use_container_width=True,
-        column_config={
-            "winrate": st.column_config.NumberColumn("winrate (%)", format="%.1f"),
+st.markdown("### Reconciliation & Data Quality")
+render_status_cards(
+    [
+        {"label": "Rows parsed", "value": f"{recon['raw_rows']:,}", "status_class": status_class},
+        {"label": "Files uploaded", "value": f"{recon['file_count']:,}", "status_class": status_class},
+        {
+            "label": "Date range",
+            "value": date_range_label,
+            "status_class": status_class,
         },
-    )
+        {"label": "Duplicates removed", "value": f"{recon['duplicate_count']:,}", "status_class": status_class},
+        {"label": "Unmatched legs", "value": f"{recon['unmatched_legs']:,}", "status_class": status_class},
+        {"label": "Open qty leftover", "value": f"{recon['open_qty']:,}", "status_class": status_class},
+        {
+            "label": "Fees included",
+            "value": f"{'Yes' if recon['fees_included'] else 'No'} ({', '.join(recon['fee_columns']) or '—'})",
+            "status_class": "status-clean" if recon["fees_included"] else "status-warn",
+        },
+        {
+            "label": "Roll detection",
+            "value": recon["roll_confidence"],
+            "status_class": status_class,
+        },
+    ]
+)
 
-# -------------------------
-# Insights (out-of-the-box)
-# -------------------------
-st.header("2) Insights")
+if has_issues:
+    st.warning(f"{status_icon} Issues detected — review before trusting results.")
 
-if trades_sheet.empty:
-    st.info("No closed trades to analyze for insights (only open positions found).")
-else:
-    # Add derived fields
+with st.expander("View issues", expanded=has_issues):
+    if issues:
+        st.dataframe(pd.DataFrame(issues).head(50), use_container_width=True)
+    else:
+        st.success("No reconciliation issues detected.")
+
+nav_tabs = ["Overview", "Journal", "Options", "Diagnostics", "Export", "Settings"]
+nav_index = nav_tabs.index(st.session_state.get("nav_tab", "Overview"))
+nav_selection = st.radio(
+    "Navigation",
+    nav_tabs,
+    index=nav_index,
+    horizontal=True,
+    key="nav_tab",
+    label_visibility="collapsed",
+)
+if st.session_state.get("last_nav") != nav_selection:
+    st.session_state["last_nav"] = nav_selection
+    log_event("page_view", details={"tab": nav_selection}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
+
+mistake_output = {"mistakes_df": pd.DataFrame(), "summary_by_type": pd.DataFrame(), "summary_by_week": pd.DataFrame(),
+                  "examples_by_type": pd.DataFrame(), "held_tables": {}}
+if not trades_sheet.empty:
+    base_mistakes = trades_sheet.copy()
+    base_mistakes["open_date"] = base_mistakes[["buy_date", "sell_date"]].min(axis=1)
+    base_mistakes["close_date"] = base_mistakes[["buy_date", "sell_date"]].max(axis=1)
+    mistake_output = detect_mistakes(base_mistakes, work)
+
+daily_pnl = pd.DataFrame()
+if not trades_sheet.empty:
     ts = trades_sheet.copy()
     ts["open_date"] = ts[["buy_date", "sell_date"]].min(axis=1)
     ts["close_date"] = ts[["buy_date", "sell_date"]].max(axis=1)
     ts["hold_days"] = (ts["close_date"] - ts["open_date"]).dt.total_seconds() / (24 * 3600)
     ts["position_type"] = np.where(ts["sell_date"] < ts["buy_date"], "SHORT", "LONG")
-
-    st.markdown("### Daily P&L Calendar")
-    realized_only = st.toggle("Realized only", value=True)
-    if not realized_only:
-        st.info("All (open/unrealized) calendar view is not available yet. Showing realized only.")
-
     daily_pnl = compute_daily_pnl(ts)
-    if daily_pnl.empty:
-        st.info("No closed trades available to build the daily calendar.")
+
+mark_data_available = False
+
+if nav_selection == "Overview":
+    st.markdown("### Overview")
+    if trades_sheet.empty:
+        st.info("No closed trades to display yet.")
     else:
-        daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
-        month_options = sorted(daily_pnl["month"].unique().tolist())
-        default_month = pd.to_datetime(ts["close_date"]).max().strftime("%Y-%m")
-        default_index = month_options.index(default_month) if default_month in month_options else len(month_options) - 1
+        pnl_total = float(trades_sheet["net_pnl"].sum())
+        winrate = float((trades_sheet["net_pnl"] > 0).mean())
+        wins = trades_sheet[trades_sheet["net_pnl"] > 0]["net_pnl"]
+        losses = trades_sheet[trades_sheet["net_pnl"] < 0]["net_pnl"]
+        profit_factor = wins.sum() / abs(losses.sum()) if not losses.empty else np.inf
 
-        month_sel = st.selectbox("Month", options=month_options, index=default_index)
-        selected_day = render_pnl_calendar(daily_pnl, month_sel)
-
-        if selected_day:
-            st.markdown(f"#### Trades closed on {selected_day:%Y-%m-%d}")
-            filtered_day = apply_day_filter(ts, selected_day)
-            if st.button("Clear day filter"):
-                st.session_state["selected_day"] = None
-            st.dataframe(
-                filtered_day.sort_values("close_date", ascending=False),
-                use_container_width=True,
-            )
-
-    # Filters
-    with st.expander("Filters", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            under_sel = st.multiselect("Underlying", options=sorted(ts["underlying"].unique().tolist()),
-                                       default=sorted(ts["underlying"].unique().tolist()))
-        with c2:
-            right_sel = st.multiselect("Type (C/P/Stock)", options=sorted(ts["right"].unique().tolist()),
-                                       default=sorted(ts["right"].unique().tolist()))
-        with c3:
-            pos_sel = st.multiselect("Position (SHORT/LONG)", options=sorted(ts["position_type"].unique().tolist()),
-                                     default=sorted(ts["position_type"].unique().tolist()))
-        with c4:
-            dmin = ts["close_date"].min().date()
-            dmax = ts["close_date"].max().date()
-            date_range = st.date_input("Close date range", value=(dmin, dmax), min_value=dmin, max_value=dmax)
-
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        d0, d1 = date_range
-    else:
-        d0 = dmin; d1 = dmax
-
-    f = ts[
-        ts["underlying"].isin(under_sel)
-        & ts["right"].isin(right_sel)
-        & ts["position_type"].isin(pos_sel)
-        & (ts["close_date"].dt.date >= d0)
-        & (ts["close_date"].dt.date <= d1)
-    ].copy()
-
-    if f.empty:
-        st.warning("No trades match your filters.")
-    else:
-        wins = f[f["net_pnl"] > 0]["net_pnl"]
-        losses = f[f["net_pnl"] < 0]["net_pnl"]
-
-        total_net = float(f["net_pnl"].sum())
-        total_gross = float(f["gross_pnl"].sum())
-        total_fees = float(f["fees"].sum())
-        n = len(f)
-        win_rate = float((f["net_pnl"] > 0).mean()) if n else 0.0
-        avg = float(f["net_pnl"].mean()) if n else 0.0
-        med = float(f["net_pnl"].median()) if n else 0.0
-        avg_win = float(wins.mean()) if len(wins) else 0.0
-        avg_loss = float(losses.mean()) if len(losses) else 0.0
-        payoff = (avg_win / abs(avg_loss)) if (avg_win and avg_loss) else np.nan
-        profit_factor = (wins.sum() / abs(losses.sum())) if len(losses) and len(wins) else np.nan
-        expectancy = avg  # same as avg net per closed match
-
-        render_stat_cards(
-            [
-                {
-                    "label": "Net P&L",
-                    "value": f"${total_net:,.2f}",
-                    "sub": "Filtered trades",
-                },
-                {
-                    "label": "Trades",
-                    "value": f"{n:,}",
-                    "sub": "Closed matches",
-                },
-                {
-                    "label": "Win rate",
-                    "value": f"{win_rate*100:,.1f}%",
-                    "sub": "Filtered trades",
-                },
-                {
-                    "label": "Expectancy / trade",
-                    "value": f"${expectancy:,.2f}",
-                    "sub": "Avg net per trade",
-                },
-                {
-                    "label": "Profit factor",
-                    "value": "—" if np.isnan(profit_factor) else f"{profit_factor:,.2f}",
-                    "sub": "Gross wins / losses",
-                },
-            ]
-        )
-
-        fee_drag = (total_fees / abs(total_gross)) if total_gross else np.nan
-        render_stat_cards(
-            [
-                {
-                    "label": "Avg win",
-                    "value": f"${avg_win:,.2f}" if len(wins) else "—",
-                    "sub": "Winning trades",
-                },
-                {
-                    "label": "Avg loss",
-                    "value": f"${avg_loss:,.2f}" if len(losses) else "—",
-                    "sub": "Losing trades",
-                },
-                {
-                    "label": "Payoff ratio",
-                    "value": "—" if np.isnan(payoff) else f"{payoff:,.2f}",
-                    "sub": "Avg win / loss",
-                },
-                {
-                    "label": "Fee drag",
-                    "value": "—" if np.isnan(fee_drag) else f"{fee_drag*100:,.2f}%",
-                    "sub": "Fees vs gross P&L",
-                },
-            ]
-        )
-
-        # Equity curve + drawdown
-        curve = f.sort_values("close_date")[["close_date", "net_pnl"]].copy()
+        curve = trades_sheet.sort_values("close_date")[["close_date", "net_pnl"]].copy()
         curve["cum_net"] = curve["net_pnl"].cumsum()
         curve["peak"] = curve["cum_net"].cummax()
         curve["drawdown"] = curve["cum_net"] - curve["peak"]
         max_dd = float(curve["drawdown"].min()) if not curve.empty else 0.0
+        avg_win = float(wins.mean()) if not wins.empty else 0.0
+        avg_loss = float(losses.mean()) if not losses.empty else 0.0
 
-        c1, c2 = st.columns(2)
+        render_stat_cards(
+            [
+                {"label": "Realized P&L", "value": f"${pnl_total:,.2f}", "sub": "Closed trades only"},
+                {"label": "Win rate", "value": f"{winrate*100:,.1f}%", "sub": "Realized only"},
+                {"label": "Profit factor", "value": "∞" if np.isinf(profit_factor) else f"{profit_factor:,.2f}", "sub": "Realized only"},
+                {"label": "Max drawdown", "value": f"${abs(max_dd):,.2f}", "sub": "Realized equity curve"},
+                {"label": "# Trades", "value": f"{len(trades_sheet):,}", "sub": "Closed matches"},
+                {"label": "Avg win / Avg loss", "value": f"${avg_win:,.0f} / ${avg_loss:,.0f}", "sub": "Realized only"},
+            ]
+        )
+
+        c1, c2 = st.columns([2, 1])
         with c1:
-            st.markdown("#### Cumulative realized P&L")
-            st.line_chart(curve.set_index("close_date")["cum_net"])
-            st.caption(f"Max drawdown: ${max_dd:,.2f}")
+            st.markdown("#### Equity curve + drawdown (realized)")
+            st.line_chart(curve.set_index("close_date")[["cum_net", "drawdown"]])
         with c2:
-            st.markdown("#### Holding time")
-            st.write(f"Median hold: **{f['hold_days'].median():.1f} days** | Avg hold: **{f['hold_days'].mean():.1f} days**")
-            # bucket holds for a quick view
-            bins = [-0.01, 1, 3, 7, 14, 30, 90, 3650]
-            labels = ["≤1d", "1–3d", "3–7d", "7–14d", "14–30d", "30–90d", "90d+"]
-            f["hold_bucket"] = pd.cut(f["hold_days"], bins=bins, labels=labels)
-            by_hold = (f.groupby("hold_bucket", as_index=False)
-                       .agg(trades=("net_pnl","size"), win_rate=("net_pnl", lambda s: float((s>0).mean())),
-                            net_pnl=("net_pnl","sum"), avg_pnl=("net_pnl","mean"))
-                       )
-            st.dataframe(by_hold, use_container_width=True)
+            st.markdown("#### Top 3 leaks costing you money")
+            summary_by_type = mistake_output["summary_by_type"]
+            if summary_by_type.empty:
+                st.info("No rule-based leaks detected yet.")
+            else:
+                top_leaks = summary_by_type.head(3).to_dict("records")
+                for leak in top_leaks:
+                    rule_text = LEAK_RULES.get(leak["mistake_type"], "Follow your risk rules.")
+                    st.markdown(
+                        f"**{leak['mistake_type']}**  \n"
+                        f"Damage: ${leak['total_damage']:,.2f} • Count: {int(leak['count'])}  \n"
+                        f"_Rule_: {rule_text}",
+                    )
+                    if st.button("Show examples", key=f"leak-{leak['mistake_type']}"):
+                        st.session_state["nav_tab"] = "Diagnostics"
+                        st.session_state["diagnostics_mistake_type"] = leak["mistake_type"]
+                        st.experimental_rerun()
 
-        st.markdown("#### Timing performance")
-        f["close_day_name"] = f["close_date"].dt.day_name()
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        by_day = (f.groupby("close_day_name", as_index=False)
-                  .agg(trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum"), avg_pnl=("net_pnl", "mean")))
-        by_day["close_day_name"] = pd.Categorical(by_day["close_day_name"], categories=day_order, ordered=True)
-        by_day = by_day.sort_values("close_day_name")
-
-        f["close_hour"] = f["close_date"].dt.hour.fillna(0).astype(int)
-        by_hour = (f.groupby("close_hour", as_index=False)
-                   .agg(trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum"), avg_pnl=("net_pnl", "mean"))
-                   .sort_values("close_hour"))
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Net P&L by day of week**")
-            st.bar_chart(by_day.set_index("close_day_name")["net_pnl"])
-        with c2:
-            st.markdown("**Net P&L by hour of day**")
-            st.bar_chart(by_hour.set_index("close_hour")["net_pnl"])
-
-        st.markdown("#### P&L distribution per trade")
-        if f["net_pnl"].nunique() > 1:
-            hist_vals, bin_edges = np.histogram(f["net_pnl"], bins=20)
-            bin_labels = [f"{bin_edges[i]:.0f} to {bin_edges[i + 1]:.0f}" for i in range(len(bin_edges) - 1)]
-            hist_df = pd.DataFrame({"P&L bucket": bin_labels, "Trades": hist_vals})
-            st.bar_chart(hist_df.set_index("P&L bucket")["Trades"])
+        st.markdown("#### Daily P&L calendar (realized)")
+        if daily_pnl.empty:
+            st.info("No closed trades available to build the daily calendar.")
         else:
-            st.info("Not enough variation in trade P&L to build a distribution chart.")
+            daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
+            month_options = sorted(daily_pnl["month"].unique().tolist())
+            default_month = pd.to_datetime(trades_sheet["close_date"]).max().strftime("%Y-%m")
+            default_index = month_options.index(default_month) if default_month in month_options else len(month_options) - 1
+            month_sel = st.selectbox("Month", options=month_options, index=default_index, key="overview-month")
+            selected_day = render_pnl_calendar(daily_pnl, month_sel)
+            if selected_day:
+                st.caption(f"Trades closed on {selected_day:%Y-%m-%d}")
 
-        st.markdown("#### Where you make/lose money")
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.markdown("**By underlying**")
-            by_under = (f.groupby("underlying", as_index=False)
-                        .agg(trades=("net_pnl","size"),
-                             win_rate=("net_pnl", lambda s: float((s>0).mean())),
-                             net_pnl=("net_pnl","sum"),
-                             avg_pnl=("net_pnl","mean"),
-                             fees=("fees","sum"))
-                        .sort_values("net_pnl", ascending=False))
-            st.dataframe(by_under, use_container_width=True)
-
-        with c2:
-            st.markdown("**By instrument type & position**")
-            by_type = (f.groupby(["right","position_type"], as_index=False)
-                       .agg(trades=("net_pnl","size"),
-                            win_rate=("net_pnl", lambda s: float((s>0).mean())),
-                            net_pnl=("net_pnl","sum"),
-                            avg_pnl=("net_pnl","mean"))
-                       .sort_values(["net_pnl"], ascending=False))
-            st.dataframe(by_type, use_container_width=True)
-
-        # Best / worst
+        st.markdown("#### Top tickers")
+        by_ticker = (trades_sheet.groupby("underlying", as_index=False)
+                     .agg(net_pnl=("net_pnl", "sum"))
+                     .sort_values("net_pnl", ascending=False))
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Top 10 winners**")
-            st.dataframe(f.sort_values("net_pnl", ascending=False).head(10)[
-                ["close_date","underlying","expiry","strike","right","position_type","qty","net_pnl","fees","hold_days"]
-            ], use_container_width=True)
+            st.markdown("**Top 5 winners**")
+            st.dataframe(by_ticker.head(5), use_container_width=True)
         with c2:
-            st.markdown("**Top 10 losers**")
-            st.dataframe(f.sort_values("net_pnl", ascending=True).head(10)[
-                ["close_date","underlying","expiry","strike","right","position_type","qty","net_pnl","fees","hold_days"]
-            ], use_container_width=True)
+            st.markdown("**Top 5 losers**")
+            st.dataframe(by_ticker.tail(5).sort_values("net_pnl"), use_container_width=True)
 
-        # Streaks (based on close order)
-        outcomes = (curve["net_pnl"] > 0).tolist()
-        def max_streak(vals, target=True):
-            best = cur = 0
-            for v in vals:
-                if v == target:
-                    cur += 1
-                    best = max(best, cur)
-                else:
-                    cur = 0
-            return best
-        st.caption(f"Max win streak: **{max_streak(outcomes, True)}** | Max loss streak: **{max_streak(outcomes, False)}**")
+        if st.session_state["user"]:
+            summary_payload = {
+                "realized_pnl": pnl_total,
+                "win_rate": winrate,
+                "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else None,
+                "max_drawdown": abs(max_dd),
+                "trade_count": len(trades_sheet),
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+                "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+            }
+            if st.button("Save run"):
+                save_run_summary(st.session_state["user"]["id"], summary_payload)
+                st.success("Run saved to your account.")
+        else:
+            st.info("Sign in to save runs and view history.")
 
-# -------------------------
-# Diagnostics & recommendations
-# -------------------------
-st.header("3) Diagnostics & recommendations")
-
-# -------------------------
-# Mistake detector
-# -------------------------
-with st.expander("Mistake Detector", expanded=False):
+elif nav_selection == "Journal":
+    st.markdown("### Journal (realized trades)")
     if trades_sheet.empty:
-        st.info("No closed trades to analyze for mistakes.")
+        st.info("No closed trades to analyze.")
     else:
-        base_mistakes = trades_sheet.copy()
-        base_mistakes["open_date"] = base_mistakes[["buy_date", "sell_date"]].min(axis=1)
-        base_mistakes["close_date"] = base_mistakes[["buy_date", "sell_date"]].max(axis=1)
+        journal_data = trades_sheet.copy()
+        if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
+            cutoff = journal_data["close_date"].max() - pd.Timedelta(days=30)
+            journal_data = journal_data[journal_data["close_date"] >= cutoff]
+            st.caption("Free tier: showing the last 30 days. Upgrade to unlock full history.")
 
-        mistake_output = detect_mistakes(base_mistakes, work)
+        journal_data["position_type"] = np.where(journal_data["sell_date"] < journal_data["buy_date"], "SHORT", "LONG")
+        with st.expander("Filters", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                under_sel = st.multiselect("Underlying", options=sorted(journal_data["underlying"].unique().tolist()),
+                                           default=sorted(journal_data["underlying"].unique().tolist()))
+            with c2:
+                right_sel = st.multiselect("Type (C/P/Stock)", options=sorted(journal_data["right"].unique().tolist()),
+                                           default=sorted(journal_data["right"].unique().tolist()))
+            with c3:
+                pos_sel = st.multiselect("Position (SHORT/LONG)", options=sorted(journal_data["position_type"].unique().tolist()),
+                                         default=sorted(journal_data["position_type"].unique().tolist()))
+        filtered = journal_data[
+            journal_data["underlying"].isin(under_sel)
+            & journal_data["right"].isin(right_sel)
+            & journal_data["position_type"].isin(pos_sel)
+        ].copy()
+        if filtered.empty:
+            st.warning("No trades match your filters.")
+        else:
+            st.dataframe(
+                filtered.sort_values("close_date", ascending=False).head(200),
+                use_container_width=True,
+            )
+            st.caption("Showing top 200 rows. Download full data from Export.")
+
+elif nav_selection == "Options":
+    if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
+        st.warning("Options view is part of the paid plan. Upgrade to unlock.")
+    else:
+        st.markdown("### Options & Open Positions")
+        if openpos.empty:
+            st.info("No open positions detected.")
+        else:
+            if mark_data_available:
+                st.success("Mark data available — unrealized P&L shown separately.")
+            else:
+                st.warning("Unrealized P&L not available yet (no mark data).")
+            st.dataframe(openpos.sort_values(["underlying", "expiry", "strike", "right", "side", "date"]), use_container_width=True)
+
+elif nav_selection == "Diagnostics":
+    if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
+        st.warning("Diagnostics are part of the paid plan. Upgrade to unlock.")
+    else:
+        st.markdown("### Diagnostics & Mistake Detector")
         mistakes_df = mistake_output["mistakes_df"]
         summary_by_type = mistake_output["summary_by_type"]
         summary_by_week = mistake_output["summary_by_week"]
         examples_by_type = mistake_output["examples_by_type"]
         held_tables = mistake_output["held_tables"]
 
-        if mistakes_df.empty:
+        if trades_sheet.empty:
+            st.info("No closed trades to analyze for mistakes.")
+        elif mistakes_df.empty:
             st.info("No mistakes detected with current rules.")
         else:
-            top_leak = summary_by_type.iloc[0] if not summary_by_type.empty else None
-            over_cnt = int((mistakes_df["mistake_type"] == "Overtrading day").sum())
-            big_loss_cnt = int((mistakes_df["mistake_type"] == "Big loss outlier").sum())
-
-            c1, c2, c3 = st.columns(3)
-            if top_leak is not None:
-                c1.metric("Top leak", f"{top_leak['mistake_type']} (${top_leak['total_damage']:,.2f})")
-            else:
-                c1.metric("Top leak", "—")
-            c2.metric("Overtrading days", f"{over_cnt:,}")
-            c3.metric("Big loss outliers", f"{big_loss_cnt:,}")
-
-            st.markdown("### Mistake summary")
             st.dataframe(summary_by_type, use_container_width=True)
-
             if not summary_by_week.empty:
-                st.markdown("### Weekly mistake damage (top 3 types)")
                 top_types = summary_by_type.head(3)["mistake_type"].tolist()
                 weekly = summary_by_week[summary_by_week["mistake_type"].isin(top_types)]
                 weekly_pivot = weekly.pivot(index="week_key", columns="mistake_type", values="total_damage").fillna(0)
                 st.line_chart(weekly_pivot)
 
-            st.markdown("### Drilldown")
-            type_sel = st.selectbox("Mistake type", summary_by_type["mistake_type"].tolist())
+            type_options = summary_by_type["mistake_type"].tolist()
+            default_type = st.session_state.get("diagnostics_mistake_type")
+            default_index = type_options.index(default_type) if default_type in type_options else 0
+            type_sel = st.selectbox("Mistake type", type_options, index=default_index)
             examples = examples_by_type[examples_by_type["mistake_type"] == type_sel].head(20).copy()
             examples["date"] = examples["close_date"].dt.date
-            show_cols = ["date", "underlying", "contract_key", "net_pnl", "severity", "details"]
-            st.dataframe(examples[show_cols], use_container_width=True)
+            st.dataframe(examples[["date", "underlying", "contract_key", "net_pnl", "severity", "details"]], use_container_width=True)
 
             if not examples.empty:
                 ex_idx = st.selectbox(
@@ -1564,9 +1709,6 @@ with st.expander("Mistake Detector", expanded=False):
                     trades_view = trades_view[trades_view["trade_id"] == selected["trade_id"]]
                 elif type_sel == "Averaged down (added to loser)":
                     trades_view = trades_view[trades_view["contract_key"] == selected["contract_key"]]
-                elif type_sel == "Held losers longer":
-                    trades_view = trades_view
-
                 st.markdown("#### Related closed trades")
                 st.dataframe(trades_view.sort_values("close_date"), use_container_width=True)
 
@@ -1574,369 +1716,193 @@ with st.expander("Mistake Detector", expanded=False):
                 st.markdown("### Holding time contrast")
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown("**Longest held losers**")
                     st.dataframe(held_tables["losers"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
                 with c2:
-                    st.markdown("**Longest held winners**")
                     st.dataframe(held_tables["winners"][["close_date", "underlying", "contract_key", "net_pnl", "holding_days"]], use_container_width=True)
 
-        if trades_sheet[["buy_date", "sell_date"]].isna().any().any():
-            st.caption("Need open_date from FIFO pairing to compute holding time.")
-
-# -------------------------
-# Actionable recommendations (based on THIS file)
-# -------------------------
-with st.expander("Post-mortem tags + root-cause stats", expanded=True):
-    if trades_sheet.empty:
-        st.info("No closed trades available to tag yet.")
+elif nav_selection == "Export":
+    if not st.session_state["user"] or (st.session_state["user"] and not st.session_state["user"]["is_subscribed"]):
+        st.warning("Export is part of the paid plan. Upgrade to unlock.")
     else:
-        if "loss_tags" not in st.session_state:
-            st.session_state["loss_tags"] = {}
-
-        losses = trades_sheet[trades_sheet["net_pnl"] < 0].copy()
-        if losses.empty:
-            st.info("No losing trades found in this file.")
-        else:
-            losses["position_type"] = np.where(losses["sell_date"] < losses["buy_date"], "SHORT", "LONG")
-            right_label = losses["right"].map({"C": "Call", "P": "Put"}).fillna(losses["right"])
-            losses["strategy"] = right_label + " " + losses["position_type"].str.title()
-            losses["post_mortem_tag"] = losses["trade_id"].map(st.session_state["loss_tags"]).fillna(UNASSIGNED_TAG)
-
-            edit_cols = [
-                "close_date",
-                "underlying",
-                "expiry",
-                "strike",
-                "right",
-                "position_type",
-                "qty",
-                "net_pnl",
-                "post_mortem_tag",
-            ]
-            edited = st.data_editor(
-                losses.set_index("trade_id")[edit_cols],
+        st.markdown("### Export")
+        with st.expander("Parsed trades (raw)", expanded=False):
+            st.dataframe(
+                work[["trade_dt", "asset_type", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80),
                 use_container_width=True,
-                hide_index=True,
-                key="loss_tag_editor",
-                disabled=[c for c in edit_cols if c != "post_mortem_tag"],
-                column_config={
-                    "post_mortem_tag": st.column_config.SelectboxColumn(
-                        "Post-mortem tag",
-                        options=[UNASSIGNED_TAG] + POST_MORTEM_TAGS,
-                    )
-                },
             )
 
-            for trade_id, tag in edited["post_mortem_tag"].to_dict().items():
-                if tag and tag != UNASSIGNED_TAG:
-                    st.session_state["loss_tags"][trade_id] = tag
-                else:
-                    st.session_state["loss_tags"].pop(trade_id, None)
-
-            tagged_losses = losses.drop(columns=["post_mortem_tag"]).merge(
-                edited[["post_mortem_tag"]],
-                left_on="trade_id",
-                right_index=True,
-                how="left",
-            )
-            tagged_losses["post_mortem_tag"] = tagged_losses["post_mortem_tag"].fillna(UNASSIGNED_TAG)
-            tagged_losses["loss_usd"] = -tagged_losses["net_pnl"]
-            tagged = tagged_losses[tagged_losses["post_mortem_tag"] != UNASSIGNED_TAG].copy()
-
-            st.markdown("### Root-cause summary (losing trades)")
-            unassigned = int((tagged_losses["post_mortem_tag"] == UNASSIGNED_TAG).sum())
-            if unassigned:
-                st.caption(f"{unassigned} losing trades are still untagged.")
-
-            if tagged.empty:
-                st.info("Assign tags above to see root-cause stats.")
-            else:
-                summary = (
-                    tagged.groupby("post_mortem_tag", as_index=False)
-                    .agg(
-                        loss_usd=("loss_usd", "sum"),
-                        count=("net_pnl", "size"),
-                        avg_loss=("net_pnl", "mean"),
-                        tickers=("underlying", lambda s: ", ".join(sorted(set(s)))),
-                        strategies=("strategy", lambda s: ", ".join(sorted(set(s)))),
-                    )
-                    .sort_values("loss_usd", ascending=False)
-                )
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**Top 3 loss causes by $**")
-                    st.dataframe(summary.head(3), use_container_width=True)
-                with c2:
-                    st.markdown("**Top 3 loss causes by count**")
-                    by_count = summary.sort_values(["count", "loss_usd"], ascending=[False, False])
-                    st.dataframe(by_count.head(3), use_container_width=True)
-
-                st.markdown("**Average loss per cause + tickers/strategies**")
-                st.dataframe(summary, use_container_width=True)
-
-# -------------------------
-# Actionable recommendations (based on THIS file)
-# -------------------------
-with st.expander("Actionable recommendations", expanded=True):
-    if trades_sheet.empty:
-        st.info("No closed trades to generate recommendations.")
-    else:
-        base = trades_sheet.copy()
-        base["open_date"] = base[["buy_date", "sell_date"]].min(axis=1)
-        base["close_date"] = base[["buy_date", "sell_date"]].max(axis=1)
-        base["hold_days"] = (base["close_date"] - base["open_date"]).dt.total_seconds() / (24 * 3600)
-        base["position_type"] = np.where(base["sell_date"] < base["buy_date"], "SHORT", "LONG")
-
-        use_filters_for_recos = st.toggle("Use the Insights filters above for these recommendations", value=False)
-        data = f.copy() if (use_filters_for_recos and "f" in locals() and isinstance(locals().get("f"), pd.DataFrame) and not locals().get("f").empty) else base
-
-        # 1) Intraday churn & fee drag
-        intraday = data[data["hold_days"] <= 1.0].copy()
-        allcnt = len(data)
-        icnt = len(intraday)
-
-        intraday_net = float(intraday["net_pnl"].sum()) if icnt else 0.0
-        intraday_gross = float(intraday["gross_pnl"].sum()) if icnt else 0.0
-        intraday_fees = float(intraday["fees"].sum()) if icnt else 0.0
-
-        # 2) Segment performance: underlying x (right, position_type)
-        seg = (data.groupby(["underlying", "right", "position_type"], as_index=False)
-               .agg(trades=("net_pnl", "size"),
-                    win_rate=("net_pnl", lambda s: float((s > 0).mean())),
-                    net_pnl=("net_pnl", "sum"),
-                    avg_pnl=("net_pnl", "mean"),
-                    fees=("fees", "sum"))
-               .sort_values("net_pnl", ascending=True))
-        seg = seg.copy()
-        right_label = seg["right"].map({"C": "Call", "P": "Put"}).fillna(seg["right"])
-        seg["segment"] = seg["underlying"] + " " + right_label + " " + seg["position_type"].str.title()
-        seg["segment_key"] = seg["underlying"] + "|" + seg["right"] + "|" + seg["position_type"]
-
-        # 3) Size buckets
-        def size_bucket(q):
-            q = int(q)
-            if q == 1:
-                return "1"
-            if q == 2:
-                return "2"
-            if 3 <= q <= 5:
-                return "3–5"
-            if 6 <= q <= 10:
-                return "6–10"
-            return "11+"
-
-        sb = data.copy()
-        sb["size_bucket"] = sb["qty"].apply(size_bucket)
-        by_size = (sb.groupby("size_bucket", as_index=False)
-                   .agg(trades=("net_pnl","size"),
-                        win_rate=("net_pnl", lambda s: float((s>0).mean())),
-                        net_pnl=("net_pnl","sum"),
-                        avg_pnl=("net_pnl","mean"),
-                        fees=("fees","sum"))
-                   )
-        order = ["1","2","3–5","6–10","11+"]
-        by_size["size_bucket"] = pd.Categorical(by_size["size_bucket"], categories=order, ordered=True)
-        by_size = by_size.sort_values("size_bucket")
-
-        # -------- Present key findings --------
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Closed matches analyzed", f"{allcnt:,}")
-        c2.metric("Intraday share", f"{(icnt/allcnt*100 if allcnt else 0):,.1f}%")
-        c3.metric("Intraday net P&L", f"${intraday_net:,.2f}")
-        c4.metric("Intraday fees", f"${intraday_fees:,.2f}")
-
-        st.markdown("### Key diagnostics")
-
-        # Heuristic flags
-        reco_lines = []
-
-        if icnt >= max(10, 0.4 * allcnt):
-            # fee-driven churn check
-            if abs(intraday_gross) <= 0.2 * intraday_fees and intraday_fees > 0:
-                reco_lines.append(f"**Reduce intraday churn.** Intraday gross is near flat (${intraday_gross:,.2f}) but fees are ${intraday_fees:,.2f}, turning it into net ${intraday_net:,.2f}.")
-            elif intraday_net < 0:
-                reco_lines.append(f"**Intraday segment is negative.** Net ${intraday_net:,.2f} across {icnt} intraday matches — consider banning 0–1 day holds for a week and re-checking expectancy.")
-        elif icnt > 0 and intraday_net < 0:
-            reco_lines.append(f"**Intraday is negative** (${intraday_net:,.2f}). Consider moving to 2–7 day holds or fewer round trips.")
-
-        # Identify worst segment(s) with enough samples
-        seg2 = seg[seg["trades"] >= 10].copy()
-        if not seg2.empty:
-            worst = seg2.iloc[0]
-            if worst["right"] == "C":
-                right_label = "Calls"
-            elif worst["right"] == "P":
-                right_label = "Puts"
-            else:
-                right_label = "Stock"
-            reco_lines.append(f"**Stop/Reduce this losing segment:** {worst['underlying']} {worst['position_type']} {right_label} — net ${float(worst['net_pnl']):,.2f} over {int(worst['trades'])} matches (win rate {float(worst['win_rate'])*100:,.1f}%).")
-
-        # SPY focus if present
-        spy = seg[seg["underlying"] == "SPY"].copy()
-        if not spy.empty:
-            spy_lc = spy[(spy["right"]=="C") & (spy["position_type"]=="LONG")]
-            if not spy_lc.empty and float(spy_lc["net_pnl"].iloc[0]) < 0 and int(spy_lc["trades"].iloc[0]) >= 5:
-                reco_lines.append(f"**SPY long calls are hurting you:** net ${float(spy_lc['net_pnl'].iloc[0]):,.2f} over {int(spy_lc['trades'].iloc[0])} matches. Consider avoiding same-day SPY call buys or switching to longer DTE / defined-risk structures.")
-
-            spy_sp = spy[(spy["right"]=="P") & (spy["position_type"]=="SHORT")]
-            if not spy_sp.empty and float(spy_sp["net_pnl"].iloc[0]) > 0 and int(spy_sp["trades"].iloc[0]) >= 3:
-                reco_lines.append(f"**Lean into what works:** SPY short puts show net ${float(spy_sp['net_pnl'].iloc[0]):,.2f} over {int(spy_sp['trades'].iloc[0])} matches. Keep this style; add an exit rule (e.g., take profit at 50–70% of premium) to reduce tail losses.")
-
-        # Oversizing
-        lose_big = by_size[(by_size["size_bucket"].isin(["6–10","11+"])) & (by_size["avg_pnl"] < 0)]
-        if not lose_big.empty:
-            worstb = lose_big.sort_values("avg_pnl").iloc[0]
-            reco_lines.append(f"**Cap size on this bucket:** {worstb['size_bucket']} contracts have avg ${float(worstb['avg_pnl']):,.2f}/match (net ${float(worstb['net_pnl']):,.2f}). Cap longs to ≤5 until this flips positive.")
-
-        if not reco_lines:
-            reco_lines.append("No strong red flags detected with current heuristics. Use the tables below to decide what to scale up/down.")
-
-        for line in reco_lines:
-            st.warning(line)
-
-        st.markdown("### Tables you can act on")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Worst segments (min 5 trades)**")
-            st.dataframe(seg[seg["trades"] >= 5].sort_values("net_pnl").head(20), use_container_width=True)
-        with c2:
-            st.markdown("**By size bucket**")
-            st.dataframe(by_size, use_container_width=True)
-
-        st.markdown("### Quick “Do more / Do less” lists")
-        base_seg = seg[seg["trades"] >= 3].copy()
-        top = base_seg.sort_values("net_pnl", ascending=False).head(10)
-        bot = base_seg.sort_values("net_pnl", ascending=True).head(10)
-        overlap_keys = set(top["segment_key"]).intersection(bot["segment_key"])
-
-        def add_list_flags(df: pd.DataFrame, list_name: str) -> pd.DataFrame:
-            flagged = df.copy()
-            flagged["list_flag"] = np.where(flagged["segment_key"].isin(overlap_keys), "both lists", list_name)
-            return flagged
-
-        top = add_list_flags(top, "top")
-        bot = add_list_flags(bot, "bottom")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.success("Do more of (best segments)")
-            top_show = top.drop(columns=["segment_key"])
-            top_show = top_show[["segment", "list_flag", "trades", "win_rate", "net_pnl", "avg_pnl", "fees",
-                                 "underlying", "right", "position_type"]]
-            st.dataframe(top_show, use_container_width=True)
-        with c2:
-            st.error("Do less of (worst segments)")
-            bot_show = bot.drop(columns=["segment_key"])
-            bot_show = bot_show[["segment", "list_flag", "trades", "win_rate", "net_pnl", "avg_pnl", "fees",
-                                 "underlying", "right", "position_type"]]
-            st.dataframe(bot_show, use_container_width=True)
-
-        if overlap_keys:
-            st.caption("Segments tagged as “both lists” appear because the list size exceeds the number of unique segments "
-                       "or because net P&L is near the middle of the distribution. Use trades, win rate, and avg P&L to "
-                       "decide whether the segment is truly strong or weak.")
-
-st.header("4) Data tables & export")
-
-with st.expander("Parsed trades (raw)", expanded=False):
-    st.dataframe(
-        work[["trade_dt", "asset_type", "underlying", "expiry", "strike", "right", "side", "qty", "price", "fees"]].head(80),
-        use_container_width=True,
-    )
-
-if not trades_sheet.empty:
-    with st.expander("Dashboard (realized)", expanded=False):
-        dash = (trades_sheet.groupby("underlying", as_index=False)
-                .agg(net_pnl=("net_pnl", "sum"), gross_pnl=("gross_pnl", "sum"), fees=("fees", "sum"))
-                ).sort_values("net_pnl", ascending=False)
-        st.dataframe(dash, use_container_width=True)
-
-with st.expander("Export Excel", expanded=True):
-    fname = st.text_input("Output filename", "trade_analysis.xlsx")
-
-    def to_excel_bytes():
-        import io as _io
-        from openpyxl.styles import PatternFill, Font
-        from openpyxl.utils import get_column_letter
-
-        buf = _io.BytesIO()
-
-        dash = pd.DataFrame()
         if not trades_sheet.empty:
-            dash = (trades_sheet.groupby("underlying", as_index=False)
-                    .agg(net_pnl=("net_pnl", "sum"), gross_pnl=("gross_pnl", "sum"), fees=("fees", "sum"))
-                    ).sort_values("net_pnl", ascending=False)
+            with st.expander("Dashboard (realized)", expanded=False):
+                dash = (trades_sheet.groupby("underlying", as_index=False)
+                        .agg(net_pnl=("net_pnl", "sum"), gross_pnl=("gross_pnl", "sum"), fees=("fees", "sum"))
+                        ).sort_values("net_pnl", ascending=False)
+                st.dataframe(dash, use_container_width=True)
 
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            if not dash.empty:
-                dash.to_excel(writer, sheet_name="Dashboard", index=False)
-            if not trades_sheet.empty:
-                trades_sheet.to_excel(writer, sheet_name="Trades", index=False)
-            if not spy_trades.empty:
-                spy_trades.to_excel(writer, sheet_name="SPY", index=False)
-            if not openpos.empty:
-                openpos.to_excel(writer, sheet_name="OpenPositions", index=False)
-            
-            # Insights summary
-            if not trades_sheet.empty:
-                _base = trades_sheet.copy()
-                _base["open_date"] = _base[["buy_date", "sell_date"]].min(axis=1)
-                _base["close_date"] = _base[["buy_date", "sell_date"]].max(axis=1)
-                _base["hold_days"] = (_base["close_date"] - _base["open_date"]).dt.total_seconds() / (24 * 3600)
-                _base["position_type"] = np.where(_base["sell_date"] < _base["buy_date"], "SHORT", "LONG")
-                _intraday = _base[_base["hold_days"] <= 1.0]
-                intraday_summary = pd.DataFrame([{
-                    "closed_matches": len(_base),
-                    "intraday_matches": len(_intraday),
-                    "intraday_share": (len(_intraday)/len(_base) if len(_base) else 0.0),
-                    "intraday_net_pnl": float(_intraday["net_pnl"].sum()) if len(_intraday) else 0.0,
-                    "intraday_gross_pnl": float(_intraday["gross_pnl"].sum()) if len(_intraday) else 0.0,
-                    "intraday_fees": float(_intraday["fees"].sum()) if len(_intraday) else 0.0,
-                }])
-                intraday_summary.to_excel(writer, sheet_name="Insights", index=False)
+        with st.expander("Export Excel", expanded=True):
+            fname = st.text_input("Output filename", "trade_analysis.xlsx")
 
-                seg = (_base.groupby(["underlying","right","position_type"], as_index=False)
-                       .agg(trades=("net_pnl","size"),
-                            win_rate=("net_pnl", lambda s: float((s>0).mean())),
-                            net_pnl=("net_pnl","sum"),
-                            avg_pnl=("net_pnl","mean"),
-                            fees=("fees","sum"))
-                       .sort_values("net_pnl", ascending=True))
-                seg.to_excel(writer, sheet_name="Segments", index=False)
+            def to_excel_bytes():
+                import io as _io
+                from openpyxl.styles import PatternFill, Font
+                from openpyxl.utils import get_column_letter
 
-            work.to_excel(writer, sheet_name="RawParsed", index=False)
+                buf = _io.BytesIO()
 
-            wb = writer.book
+                dash = pd.DataFrame()
+                if not trades_sheet.empty:
+                    dash = (trades_sheet.groupby("underlying", as_index=False)
+                            .agg(net_pnl=("net_pnl", "sum"), gross_pnl=("gross_pnl", "sum"), fees=("fees", "sum"))
+                            ).sort_values("net_pnl", ascending=False)
 
-            if "Trades" in wb.sheetnames:
-                ws = wb["Trades"]
-                headers = [cell.value for cell in ws[1]]
-                if "underlying" in headers:
-                    idx = headers.index("underlying") + 1
-                    fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                    for r in range(2, ws.max_row + 1):
-                        if ws.cell(row=r, column=idx).value == "SPY":
-                            for c in range(1, ws.max_column + 1):
-                                ws.cell(row=r, column=c).fill = fill
-                for col in range(1, min(ws.max_column, 20) + 1):
-                    ws.column_dimensions[get_column_letter(col)].width = 16
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    if not dash.empty:
+                        dash.to_excel(writer, sheet_name="Dashboard", index=False)
+                    if not trades_sheet.empty:
+                        trades_sheet.to_excel(writer, sheet_name="Trades", index=False)
+                    if not spy_trades.empty:
+                        spy_trades.to_excel(writer, sheet_name="SPY", index=False)
+                    if not openpos.empty:
+                        openpos.to_excel(writer, sheet_name="OpenPositions", index=False)
 
-            if "SPY" in wb.sheetnames:
-                ws = wb["SPY"]
-                last = ws.max_row + 2
-                ws.cell(row=last, column=1).value = "SPY net total (closed)"
-                ws.cell(row=last, column=2).value = spy_total
-                ws.cell(row=last, column=1).font = Font(bold=True)
-                ws.cell(row=last, column=2).font = Font(bold=True)
+                    work.to_excel(writer, sheet_name="RawParsed", index=False)
 
-        buf.seek(0)
-        return buf.getvalue()
+                    wb = writer.book
 
-    if st.button("Generate Excel"):
-        st.download_button(
-            "Download Excel",
-            data=to_excel_bytes(),
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        st.success("Generated Excel.")
+                    if "Trades" in wb.sheetnames:
+                        ws = wb["Trades"]
+                        headers = [cell.value for cell in ws[1]]
+                        if "underlying" in headers:
+                            idx = headers.index("underlying") + 1
+                            fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                            for r in range(2, ws.max_row + 1):
+                                if ws.cell(row=r, column=idx).value == "SPY":
+                                    for c in range(1, ws.max_column + 1):
+                                        ws.cell(row=r, column=c).fill = fill
+                        for col in range(1, min(ws.max_column, 20) + 1):
+                            ws.column_dimensions[get_column_letter(col)].width = 16
+
+                    if "SPY" in wb.sheetnames:
+                        ws = wb["SPY"]
+                        last = ws.max_row + 2
+                        ws.cell(row=last, column=1).value = "SPY net total (closed)"
+                        ws.cell(row=last, column=2).value = spy_total
+                        ws.cell(row=last, column=1).font = Font(bold=True)
+                        ws.cell(row=last, column=2).font = Font(bold=True)
+
+                buf.seek(0)
+                return buf.getvalue()
+
+            if st.button("Generate Excel"):
+                st.download_button(
+                    "Download Excel",
+                    data=to_excel_bytes(),
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                log_event("export_clicked", details={"type": "excel"}, user_id=st.session_state["user"]["id"] if st.session_state["user"] else None)
+                st.success("Generated Excel.")
+
+        st.markdown("### Share my month (PNG)")
+        if daily_pnl.empty:
+            st.info("Need closed trades to generate a shareable month summary.")
+        else:
+            daily_pnl["month"] = pd.to_datetime(daily_pnl["trade_day"]).dt.to_period("M").astype(str)
+            month_options = sorted(daily_pnl["month"].unique().tolist())
+            month_sel = st.selectbox("Month to share", month_options, index=len(month_options) - 1, key="share-month")
+            summary_by_type = mistake_output["summary_by_type"]
+            top_leaks = summary_by_type.head(3).to_dict("records") if not summary_by_type.empty else []
+            by_ticker = (trades_sheet.groupby("underlying", as_index=False)
+                         .agg(net_pnl=("net_pnl", "sum"))
+                         .sort_values("net_pnl", ascending=False))
+            summary_payload = {
+                "realized_pnl": float(trades_sheet["net_pnl"].sum()),
+                "max_drawdown": abs(float(trades_sheet.sort_values("close_date")["net_pnl"].cumsum().sub(
+                    trades_sheet.sort_values("close_date")["net_pnl"].cumsum().cummax()).min())),
+                "top_winner": by_ticker.head(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+                "top_loser": by_ticker.tail(1)["underlying"].iloc[0] if not by_ticker.empty else None,
+            }
+            png_bytes = build_share_image(daily_pnl[daily_pnl["month"] == month_sel], month_sel, summary_payload, top_leaks)
+            st.download_button(
+                "Download shareable PNG",
+                data=png_bytes,
+                file_name=f"trade-summary-{month_sel}.png",
+                mime="image/png",
+            )
+
+elif nav_selection == "Settings":
+    st.markdown("### Settings")
+    if st.session_state["user"]:
+        st.success(f"Signed in as {st.session_state['user']['email']}")
+        if st.button("Sign out"):
+            st.session_state["user"] = None
+            st.experimental_rerun()
+    else:
+        st.markdown("#### Sign in or create account")
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Sign in"):
+                user = verify_user(email, password)
+                if user:
+                    st.session_state["user"] = user
+                    log_event("login", user_id=user["id"])
+                    st.experimental_rerun()
+                else:
+                    st.error("Invalid credentials.")
+        with c2:
+            if st.button("Create account"):
+                if get_user_by_email(email):
+                    st.error("Account already exists.")
+                else:
+                    user = create_user(email, password)
+                    st.session_state["user"] = user
+                    log_event("signup", user_id=user["id"])
+                    st.experimental_rerun()
+
+    if st.session_state["user"]:
+        st.markdown("#### Subscription")
+        subscribed = bool(st.session_state["user"]["is_subscribed"])
+        st.write(f"Status: {'Active' if subscribed else 'Free'}")
+        allow_self_subscribe = os.getenv("ALLOW_SELF_SUBSCRIBE", "false").lower() == "true"
+        if not subscribed:
+            if allow_self_subscribe and st.button("Activate subscription (demo)"):
+                set_subscription(st.session_state["user"]["id"], True)
+                st.session_state["user"]["is_subscribed"] = 1
+                st.success("Subscription activated.")
+            else:
+                st.caption("Upgrade to unlock Diagnostics, Options, and Export.")
+
+        st.markdown("#### Saved runs")
+        runs_df = load_run_summaries(st.session_state["user"]["id"])
+        if runs_df.empty:
+            st.info("No saved runs yet.")
+        else:
+            st.dataframe(runs_df, use_container_width=True)
+
+        st.markdown("#### Telemetry (admin)")
+        admin_emails = [e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()]
+        if st.session_state["user"]["email"] in admin_emails:
+            conn = get_db_conn()
+            events_df = pd.read_sql_query("SELECT * FROM events ORDER BY created_at DESC LIMIT 200", conn)
+            conn.close()
+            if events_df.empty:
+                st.info("No telemetry yet.")
+            else:
+                events_df["created_at"] = pd.to_datetime(events_df["created_at"], errors="coerce")
+                events_df["day"] = events_df["created_at"].dt.date
+                daily_active = events_df.groupby("day")["session_id"].nunique().reset_index(name="active_sessions")
+                st.markdown("**Daily active sessions**")
+                st.line_chart(daily_active.set_index("day")["active_sessions"])
+
+                funnel = events_df["event_name"].value_counts().reindex(
+                    ["file_uploaded", "analysis_run", "export_clicked"], fill_value=0
+                ).reset_index()
+                funnel.columns = ["event", "count"]
+                st.markdown("**Upload → analysis → export funnel**")
+                st.dataframe(funnel, use_container_width=True)
+
+                error_events = events_df[events_df["event_name"] == "error"]
+                if not error_events.empty:
+                    st.markdown("**Top errors**")
+                    st.dataframe(error_events.head(20), use_container_width=True)
